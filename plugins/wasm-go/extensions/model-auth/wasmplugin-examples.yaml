@@ -1,0 +1,190 @@
+# WasmPlugin 配置示例集合
+# 本文件包含多个配置示例，展示不同的使用场景
+
+# ================================================================================
+# 示例 1: 使用默认请求头（最常见的配置）
+# ================================================================================
+# 使用场景: 标准的 LLM API，使用 Authorization 和 x-higress-llm-model 请求头
+# 请求示例:
+#   curl -H "Authorization: Bearer sk-test" \
+#        -H "x-higress-llm-model: gen-studio-Qwen2.5-0.5B-Instruct-bbbb" \
+#        http://gateway/v1/chat/completions
+---
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: model-auth-default
+  namespace: higress-system
+spec:
+  defaultConfig:
+    api_key_models:
+      sk-test:
+        - "gen-studio-Qwen2.5-0.5B-Instruct-bbbb"
+      sk-weetime:
+        - "gen-studio-Qwen2.5-0.5B-Instruct-bbbb"
+        - "gen-studio-Qwen2.5-0.5B-Instruct-aaa"
+  url: oci://your-registry/model-auth:latest
+
+# ================================================================================
+# 示例 2: 使用自定义请求头（直接值格式）
+# ================================================================================
+# 使用场景: 使用 x-api-key 等自定义请求头，直接传递 API Key 值（不使用 Bearer 前缀）
+# 请求示例:
+#   curl -H "x-api-key: sk-weetime" \
+#        -H "X-Model-Name: my-model" \
+#        http://gateway/v1/chat/completions
+---
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: model-auth-custom-headers
+  namespace: higress-system
+spec:
+  defaultConfig:
+    api_key_models:
+      sk-weetime:
+        - "my-model"
+        - "another-model"
+    auth_header_name: "x-api-key"  # 非 Authorization 时，直接使用值本身
+    model_header_name: "X-Model-Name"
+  url: oci://your-registry/model-auth:latest
+
+# ================================================================================
+# 示例 3: 使用自定义 API Key 头（直接值），Model 头使用默认值
+# ================================================================================
+# 使用场景: 只需要改变 API Key 的获取方式，模型头保持标准
+# 注意: 当 auth_header_name 不是 "Authorization" 时，直接使用值本身（不需要 Bearer 前缀）
+# 请求示例:
+#   curl -H "X-Custom-Auth: sk-hybrid" \
+#        -H "x-higress-llm-model: model-a" \
+#        http://gateway/v1/chat/completions
+---
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: model-auth-custom-auth-only
+  namespace: higress-system
+spec:
+  defaultConfig:
+    api_key_models:
+      sk-hybrid:
+        - "model-a"
+        - "model-b"
+    auth_header_name: "X-Custom-Auth"  # 非 Authorization，直接传值
+    # model_header_name 不设置，使用默认值 "x-higress-llm-model"
+  url: oci://your-registry/model-auth:latest
+
+# ================================================================================
+# 示例 4: 按路由配置不同的认证规则
+# ================================================================================
+# 使用场景: 不同的路由使用不同的 API Key 和模型映射
+---
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: model-auth-multi-route
+  namespace: higress-system
+spec:
+  defaultConfig:
+    # 默认配置：用于所有未匹配 matchRules 的路由
+    api_key_models:
+      sk-default:
+        - "default-model"
+  
+  matchRules:
+  # 路由 1: VIP 客户，更多模型权限
+  - config:
+      api_key_models:
+        sk-vip:
+          - "premium-model-1"
+          - "premium-model-2"
+          - "premium-model-3"
+    ingress:
+    - vip-route
+  
+  # 路由 2: 测试环境，使用不同的请求头
+  - config:
+      api_key_models:
+        sk-test:
+          - "test-model"
+      auth_header_name: "X-Test-API-Key"
+      model_header_name: "X-Test-Model"
+    ingress:
+    - test-route
+  
+  url: oci://your-registry/model-auth:latest
+
+# ================================================================================
+# 示例 5: 生产环境完整配置
+# ================================================================================
+# 使用场景: 生产环境，包含多个 API Key 和详细的模型映射
+---
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: model-auth
+  namespace: higress-system
+  labels:
+    higress.io/wasm-plugin-description: "LLM模型访问权限控制插件"
+    higress.io/wasm-plugin-built-in: "false"
+    higress.io/wasm-plugin-category: security
+spec:
+  defaultConfig:
+    api_key_models:
+      # 基础套餐用户
+      sk-basic-001:
+        - "qwen-turbo"
+        - "qwen-plus"
+      
+      # 标准套餐用户
+      sk-standard-001:
+        - "qwen-turbo"
+        - "qwen-plus"
+        - "qwen-max"
+      
+      # 企业套餐用户
+      sk-enterprise-001:
+        - "qwen-turbo"
+        - "qwen-plus"
+        - "qwen-max"
+        - "qwen-max-longcontext"
+        - "custom-model-1"
+      
+      # 内部测试 Key
+      sk-internal-test:
+        - "test-model-alpha"
+        - "test-model-beta"
+    
+    # 使用默认请求头
+    # auth_header_name: "Authorization"  # 默认
+    # model_header_name: "x-higress-llm-model"  # 默认
+  
+  # 安全策略：插件失败时拒绝请求
+  failStrategy: FAIL_CLOSE
+  
+  # 认证阶段执行
+  phase: AUTHZ
+  
+  # 优先级
+  priority: 700
+  
+  # 镜像地址
+  url: oci://your-registry/model-auth:v2.0.0
+
+# ================================================================================
+# 使用说明
+# ================================================================================
+# 1. 选择适合你的场景的配置示例
+# 2. 修改 api_key_models 映射关系
+# 3. 如需自定义请求头，添加 auth_header_name 和 model_header_name
+# 4. 应用配置: kubectl apply -f wasmplugin-examples.yaml
+# 5. 验证配置: kubectl get wasmplugin -n higress-system
+#
+# 注意事项:
+# - auth_header_name 为 "Authorization" 时: 使用 "Bearer <token>" 格式
+#   示例: Authorization: Bearer sk-test
+# - auth_header_name 为其他值时: 直接使用值本身
+#   示例: x-api-key: sk-weetime
+#
+# 更多文档请参考: README.md
+

@@ -4,27 +4,67 @@ metadata:
   name: model-auth
   namespace: higress-system
   labels:
-    higress.io/wasm-plugin-description: "camp模型授权验证"
+    higress.io/wasm-plugin-description: "LLM模型访问权限控制插件"
     higress.io/resource-definer: higress
     higress.io/wasm-plugin-built-in: "false"
     higress.io/wasm-plugin-category: custom
-    higress.io/wasm-plugin-name: mode-auth
-    higress.io/wasm-plugin-version: 1.0.0
+    higress.io/wasm-plugin-name: model-auth
+    higress.io/wasm-plugin-version: 2.0.0
 spec:
   defaultConfig:
-    api_key: "test-secret-key-123"
+    # ========================================
+    # 必填配置项
+    # ========================================
+    # api_key_models: 定义 API Key 到允许的模型列表的映射关系
+    # 格式: api_key_models 是一个对象，每个键是 API Key，值是该 Key 允许访问的模型名称数组
+    api_key_models:
+      sk-test:
+        - "gen-studio-Qwen2.5-0.5B-Instruct-bbbb"
+      sk-weetime:
+        - "gen-studio-Qwen2.5-0.5B-Instruct-bbbb"
+        - "gen-studio-Qwen2.5-0.5B-Instruct-aaa"
+      sk-audio:
+        - "a1"
+        - "a2"
+    model_header_name: "x-higress-llm-model"
+    auth_header_name: "x-api-key"
+    # ========================================
+    # 可选配置项：自定义请求头名称
+    # ========================================
+    # auth_header_name: 指定从哪个请求头读取 API Key（Bearer Token）
+    #   - 默认值: "Authorization"
+    #   - 如果不设置，将使用默认值 "Authorization"
+    #   - 请求示例: Authorization: Bearer sk-test
+    #
+    # model_header_name: 指定从哪个请求头读取模型名称
+    #   - 默认值: "x-higress-llm-model"
+    #   - 如果不设置，将使用默认值 "x-higress-llm-model"
+    #   - 请求示例: x-higress-llm-model: gen-studio-Qwen2.5-0.5B-Instruct-bbbb
+    
+    # 取消下面两行注释可以使用自定义请求头名称：
+    # auth_header_name: "X-API-Key"
+    # model_header_name: "X-Model-Name"
+    
   matchRules:
-  - config:
-      api_key: api-service-key-123
-    ingress:
-    - ai-route-infer-8d9e797b-a180-4858-997e-c74857eb46df.internal
+  # - config:
+  #     # Per-route configuration can override the default
+  #     # 路由级别配置可以覆盖默认配置
+  #     api_key_models:
+  #       sk-custom:
+  #         - "model-1"
+  #         - "model-2"
+  #     # 也可以在路由级别自定义请求头名称
+  #     # auth_header_name: "X-Route-API-Key"
+  #     # model_header_name: "X-Route-Model"
+  #   ingress:
+  #   - ai-route-infer-8d9e797b-a180-4858-997e-c74857eb46df.internal
   defaultConfigDisable: false
-  failStrategy: FAIL_OPEN
+  failStrategy: FAIL_CLOSE
   imagePullPolicy: UNSPECIFIED_POLICY
-  phase: AUTHN
+  phase: AUTHZ
   priority: 700
   # For local testing, use file:// URL
   # url: file:///opt/plugins/wasm-go/extensions/model-auth/plugin.wasm
   # For production, use OCI registry
-  url: oci://quanzhenglong.com/camp/model-auth:20251126-171240-7c4899ad
+  url: oci://quanzhenglong.com/camp/model-auth:20251126-191529-f755368d
 
