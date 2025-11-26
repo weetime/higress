@@ -115,7 +115,7 @@ curl -H "Authorization: Bearer sk-test" \
 ## 构建说明
 
 ```bash
-PLUGIN_NAME=model-auth make build
+cd plugins/wasm-go && PLUGIN_NAME=model-auth IMG=quanzhenglong.com/camp/model-auth:v0.0.1  make build-push
 ```
 
 ## 安全建议

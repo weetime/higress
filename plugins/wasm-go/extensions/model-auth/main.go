@@ -108,7 +108,14 @@ func parseConfig(json gjson.Result, config *ModelAuthConfig, log log.Log) error 
 
 // onHttpRequestHeaders validates the API key and model from request headers
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config ModelAuthConfig, log log.Log) types.Action {
-	// Step 1: Extract API key from configured auth header
+	// Step 1: Check if model header exists - if not, skip authentication
+	modelName, err := proxywasm.GetHttpRequestHeader(config.modelHeaderName)
+	if err != nil || modelName == "" {
+		log.Debugf("%s header is missing, skipping authentication", config.modelHeaderName)
+		return types.ActionContinue
+	}
+
+	// Step 2: Extract API key from configured auth header
 	authHeader, err := proxywasm.GetHttpRequestHeader(config.authHeaderName)
 	if err != nil || authHeader == "" {
 		log.Warnf("%s header is missing", config.authHeaderName)
@@ -134,14 +141,6 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config ModelAuthConfig, log l
 			sendUnauthorizedResponse(config.authHeaderName + " header value cannot be empty")
 			return types.ActionContinue
 		}
-	}
-
-	// Step 2: Extract model name from configured model header
-	modelName, err := proxywasm.GetHttpRequestHeader(config.modelHeaderName)
-	if err != nil || modelName == "" {
-		log.Warnf("%s header is missing", config.modelHeaderName)
-		sendUnauthorizedResponse(config.modelHeaderName + " header is required")
-		return types.ActionContinue
 	}
 
 	// Step 3: Validate API key exists in configuration
