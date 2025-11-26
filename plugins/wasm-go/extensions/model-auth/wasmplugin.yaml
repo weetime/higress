@@ -1,0 +1,30 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: model-auth
+  namespace: higress-system
+  labels:
+    higress.io/wasm-plugin-description: "camp模型授权验证"
+    higress.io/resource-definer: higress
+    higress.io/wasm-plugin-built-in: "false"
+    higress.io/wasm-plugin-category: custom
+    higress.io/wasm-plugin-name: mode-auth
+    higress.io/wasm-plugin-version: 1.0.0
+spec:
+  defaultConfig:
+    api_key: "test-secret-key-123"
+  matchRules:
+  - config:
+      api_key: api-service-key-123
+    ingress:
+    - ai-route-infer-8d9e797b-a180-4858-997e-c74857eb46df.internal
+  defaultConfigDisable: false
+  failStrategy: FAIL_OPEN
+  imagePullPolicy: UNSPECIFIED_POLICY
+  phase: AUTHN
+  priority: 700
+  # For local testing, use file:// URL
+  # url: file:///opt/plugins/wasm-go/extensions/model-auth/plugin.wasm
+  # For production, use OCI registry
+  url: oci://quanzhenglong.com/camp/model-auth:20251126-171240-7c4899ad
+
