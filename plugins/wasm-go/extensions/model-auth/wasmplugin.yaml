@@ -1,15 +1,17 @@
 apiVersion: extensions.higress.io/v1alpha1
 kind: WasmPlugin
 metadata:
-  name: model-auth
+  name: model-auth.rise.io
   namespace: higress-system
+  annotations:
+    higress.io/wasm-plugin-description: 统一鉴权大模型调用，通过 API Key 和黑白名单控制访问，防止未授权请求，保障模型服务安全可控。
+    higress.io/wasm-plugin-title: model-auth
   labels:
-    higress.io/wasm-plugin-description: "LLM模型访问权限控制插件"
     higress.io/resource-definer: higress
     higress.io/wasm-plugin-built-in: "false"
     higress.io/wasm-plugin-category: custom
     higress.io/wasm-plugin-name: model-auth
-    higress.io/wasm-plugin-version: 2.0.0
+    higress.io/wasm-plugin-version: 1.0.0
 spec:
   defaultConfig:
     # ========================================
@@ -26,6 +28,14 @@ spec:
       sk-audio:
         - "a1"
         - "a2"
+    # ========================================
+    # 可选配置项：模型白名单
+    # ========================================
+    # whitelist: 白名单中的模型无需认证，直接放行
+    # 格式: 字符串数组，包含无需认证的模型名称
+    whitelist:
+      - "model-public"
+      - "model-free"
     model_header_name: "x-higress-llm-model"
     auth_header_name: "x-api-key"
     # ========================================
@@ -66,5 +76,5 @@ spec:
   # For local testing, use file:// URL
   # url: file:///opt/plugins/wasm-go/extensions/model-auth/plugin.wasm
   # For production, use OCI registry
-  url: oci://quanzhenglong.com/camp/model-auth:20251126-191529-f755368d
+  url: oci://quanzhenglong.com/camp/model-auth:v0.0.4
 

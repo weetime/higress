@@ -87,6 +87,10 @@ func init() {
 //	sk-prod:
 //	  - model-c
 //
+// whitelist:
+//   - model-public
+//   - model-free
+//
 // auth_header_name: Authorization
 // model_header_name: x-higress-llm-model
 // @End
@@ -96,6 +100,12 @@ type ModelAuthConfig struct {
 	// @Description key 为 API Key，value 为该 Key 允许访问的模型列表。
 	// @Description en-US Key is the API key, value is the list of models that the key is allowed to access.
 	apiKeyModels map[string][]string
+
+	// @Title 模型白名单
+	// @Title en-US Model Whitelist
+	// @Description 白名单中的模型无需认证，直接放行。
+	// @Description en-US Models in the whitelist are allowed without authentication.
+	whitelist []string
 
 	// @Title 认证头名称
 	// @Title en-US Auth Header Name
@@ -128,6 +138,7 @@ type ModelAuthConfig struct {
 //	}
 func parseConfig(json gjson.Result, config *ModelAuthConfig, log log.Log) error {
 	config.apiKeyModels = make(map[string][]string)
+	config.whitelist = make([]string, 0)
 
 	// Parse auth_header_name (optional)
 	config.authHeaderName = json.Get("auth_header_name").String()
@@ -139,6 +150,15 @@ func parseConfig(json gjson.Result, config *ModelAuthConfig, log log.Log) error 
 	config.modelHeaderName = json.Get("model_header_name").String()
 	if config.modelHeaderName == "" {
 		config.modelHeaderName = defaultModelHeaderName
+	}
+
+	// Parse whitelist (optional)
+	whitelistJson := json.Get("whitelist")
+	if whitelistJson.Exists() && whitelistJson.IsArray() {
+		for _, model := range whitelistJson.Array() {
+			config.whitelist = append(config.whitelist, model.String())
+		}
+		log.Infof("loaded whitelist with %d models: %v", len(config.whitelist), config.whitelist)
 	}
 
 	log.Infof("config: auth_header=%s, model_header=%s", config.authHeaderName, config.modelHeaderName)
@@ -189,7 +209,13 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config ModelAuthConfig, log l
 		return types.ActionContinue
 	}
 
-	// Step 2: Extract API key from auth header
+	// Step 2: Check whitelist - skip authentication if model is whitelisted
+	if contains(config.whitelist, modelName) {
+		log.Infof("model %q is whitelisted, skipping authentication", modelName)
+		return types.ActionContinue
+	}
+
+	// Step 3: Extract API key from auth header
 	authHeader, err := proxywasm.GetHttpRequestHeader(config.authHeaderName)
 	if err != nil || authHeader == "" {
 		log.Warnf("auth header %q is missing", config.authHeaderName)
@@ -202,14 +228,14 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config ModelAuthConfig, log l
 		return deniedInvalidAuthFormat(config.authHeaderName)
 	}
 
-	// Step 3: Validate API key exists
+	// Step 4: Validate API key exists
 	allowedModels, exists := config.apiKeyModels[apiKey]
 	if !exists {
 		log.Warnf("API key not found in configuration")
 		return deniedInvalidAPIKey()
 	}
 
-	// Step 4: Validate model access
+	// Step 5: Validate model access
 	if !contains(allowedModels, modelName) {
 		log.Warnf("model %q not allowed for this API key", modelName)
 		return deniedModelAccessDenied(modelName)
