@@ -11,23 +11,30 @@ metadata:
     higress.io/wasm-plugin-built-in: "false"
     higress.io/wasm-plugin-category: custom
     higress.io/wasm-plugin-name: model-auth
-    higress.io/wasm-plugin-version: 1.0.0
+    higress.io/wasm-plugin-version: 0.0.7
 spec:
   defaultConfig:
     # ========================================
     # 必填配置项
     # ========================================
     # api_key_models: 定义 API Key 到允许的模型列表的映射关系
-    # 格式: api_key_models 是一个对象，每个键是 API Key，值是该 Key 允许访问的模型名称数组
+    # 格式: api_key_models 是一个对象，每个键是 API Key，值包含 name（consumer 名称）和 models（允许访问的模型列表）
+    # name 会被设置到 x-mse-consumer header 中，用于标识请求来源
     api_key_models:
       sk-test:
-        - "gen-studio-Qwen2.5-0.5B-Instruct-bbbb"
+        name: "test-consumer"
+        models:
+          - "gen-studio-Qwen2.5-0.5B-Instruct-bbbb"
       sk-weetime:
-        - "gen-studio-Qwen2.5-0.5B-Instruct-bbbb"
-        - "gen-studio-Qwen2.5-0.5B-Instruct-aaa"
+        name: "weetime/ai-for-deployer"
+        models:
+          - "gen-studio-Qwen2.5-0.5B-Instruct-bbbb"
+          - "gen-studio-Qwen2.5-0.5B-Instruct-aaa"
       sk-audio:
-        - "a1"
-        - "a2"
+        name: "audio-consumer"
+        models:
+          - "a1"
+          - "a2"
     # ========================================
     # 可选配置项：模型白名单
     # ========================================
@@ -61,8 +68,10 @@ spec:
   #     # 路由级别配置可以覆盖默认配置
   #     api_key_models:
   #       sk-custom:
-  #         - "model-1"
-  #         - "model-2"
+  #         name: "custom-consumer"
+  #         models:
+  #           - "model-1"
+  #           - "model-2"
   #     # 也可以在路由级别自定义请求头名称
   #     # auth_header_name: "X-Route-API-Key"
   #     # model_header_name: "X-Route-Model"
@@ -76,5 +85,5 @@ spec:
   # For local testing, use file:// URL
   # url: file:///opt/plugins/wasm-go/extensions/model-auth/plugin.wasm
   # For production, use OCI registry
-  url: oci://quanzhenglong.com/camp/model-auth:v0.0.4
+  url: oci://quanzhenglong.com/camp/model-auth:v0.0.7
 

@@ -63,6 +63,21 @@ func init() {
 // Configuration Types
 // ============================================================================
 
+// APIKeyConfig represents the configuration for a single API key.
+type APIKeyConfig struct {
+	// @Title Consumer 名称
+	// @Title en-US Consumer Name
+	// @Description 该 API Key 对应的 consumer 名称，会被设置到 x-mse-consumer header 中。
+	// @Description en-US The consumer name for this API key, will be set to x-mse-consumer header.
+	Name string
+
+	// @Title 允许访问的模型列表
+	// @Title en-US Allowed Models
+	// @Description 该 API Key 允许访问的模型列表。
+	// @Description en-US The list of models that this API key is allowed to access.
+	Models []string
+}
+
 // @Name model-auth
 // @Category auth
 // @Phase AUTHN
@@ -72,7 +87,7 @@ func init() {
 // @Description zh-CN 本插件实现了基于 API Key 的模型访问控制功能，可以限制不同 API Key 访问特定的 LLM 模型。
 // @Description en-US This plugin implements model access control based on API Key, restricting different API keys to access specific LLM models.
 // @IconUrl https://img.alicdn.com/imgextra/i4/O1CN01BPFGlT1pGZ2VDLgaH_!!6000000005333-2-tps-42-42.png
-// @Version 1.0.0
+// @Version 0.0.7
 //
 // @Contact.name Higress Team
 // @Contact.url http://higress.io/
@@ -82,10 +97,14 @@ func init() {
 // api_key_models:
 //
 //	sk-test:
-//	  - model-a
-//	  - model-b
+//	  name: weetime/ai-for-deployer
+//	  models:
+//	    - model-a
+//	    - model-b
 //	sk-prod:
-//	  - model-c
+//	  name: prod-consumer
+//	  models:
+//	    - model-c
 //
 // whitelist:
 //   - model-public
@@ -97,9 +116,9 @@ func init() {
 type ModelAuthConfig struct {
 	// @Title API Key 与模型的映射关系
 	// @Title en-US API Key to Models Mapping
-	// @Description key 为 API Key，value 为该 Key 允许访问的模型列表。
-	// @Description en-US Key is the API key, value is the list of models that the key is allowed to access.
-	apiKeyModels map[string][]string
+	// @Description key 为 API Key，value 为该 Key 的配置（包含 name 和 models）。
+	// @Description en-US Key is the API key, value is the configuration (including name and models).
+	apiKeyModels map[string]*APIKeyConfig
 
 	// @Title 模型白名单
 	// @Title en-US Model Whitelist
@@ -130,14 +149,20 @@ type ModelAuthConfig struct {
 //
 //	{
 //	  "api_key_models": {
-//	    "sk-test": ["model-a", "model-b"],
-//	    "sk-prod": ["model-c", "model-d"]
+//	    "sk-test": {
+//	      "name": "weetime/ai-for-deployer",
+//	      "models": ["model-a", "model-b"]
+//	    },
+//	    "sk-prod": {
+//	      "name": "prod-consumer",
+//	      "models": ["model-c", "model-d"]
+//	    }
 //	  },
 //	  "auth_header_name": "Authorization",
 //	  "model_header_name": "x-higress-llm-model"
 //	}
 func parseConfig(json gjson.Result, config *ModelAuthConfig, log log.Log) error {
-	config.apiKeyModels = make(map[string][]string)
+	config.apiKeyModels = make(map[string]*APIKeyConfig)
 	config.whitelist = make([]string, 0)
 
 	// Parse auth_header_name (optional)
@@ -171,16 +196,25 @@ func parseConfig(json gjson.Result, config *ModelAuthConfig, log log.Log) error 
 
 	apiKeyModelsJson.ForEach(func(key, value gjson.Result) bool {
 		apiKey := key.String()
-		var models []string
+		keyConfig := &APIKeyConfig{}
 
-		if value.IsArray() {
-			for _, model := range value.Array() {
-				models = append(models, model.String())
+		// Parse name (required)
+		keyConfig.Name = value.Get("name").String()
+		if keyConfig.Name == "" {
+			// Fallback to apiKey as name if not specified
+			keyConfig.Name = apiKey
+		}
+
+		// Parse models
+		modelsJson := value.Get("models")
+		if modelsJson.Exists() && modelsJson.IsArray() {
+			for _, model := range modelsJson.Array() {
+				keyConfig.Models = append(keyConfig.Models, model.String())
 			}
 		}
 
-		config.apiKeyModels[apiKey] = models
-		log.Debugf("loaded API key %q with %d models", apiKey, len(models))
+		config.apiKeyModels[apiKey] = keyConfig
+		log.Debugf("loaded API key %q with name=%s, %d models", apiKey, keyConfig.Name, len(keyConfig.Models))
 		return true
 	})
 
@@ -196,54 +230,91 @@ func parseConfig(json gjson.Result, config *ModelAuthConfig, log log.Log) error 
 // ============================================================================
 
 // onHttpRequestHeaders handles the HTTP request headers for model authentication.
-// Authentication flow:
-//  1. Check if model header exists - skip auth if not present
-//  2. Extract API key from auth header
-//  3. Validate API key exists in configuration
-//  4. Check if the requested model is allowed for this API key
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config ModelAuthConfig, log log.Log) types.Action {
-	// Step 1: Check model header - skip authentication if not present
+	// Get model name from header, skip if not present
 	modelName, err := proxywasm.GetHttpRequestHeader(config.modelHeaderName)
 	if err != nil || modelName == "" {
-		log.Debugf("model header %q not found, skipping authentication", config.modelHeaderName)
+		log.Debugf("model header %q not found, skipping", config.modelHeaderName)
 		return types.ActionContinue
 	}
 
-	// Step 2: Check whitelist - skip authentication if model is whitelisted
+	// Try to get keyConfig from auth header (needed for consumer header)
+	keyConfig, authErr := config.getKeyConfig(config.authHeaderName)
+
+	// Whitelist check: allow access, but still set consumer if available
 	if contains(config.whitelist, modelName) {
-		log.Infof("model %q is whitelisted, skipping authentication", modelName)
+		setConsumerHeader(keyConfig, log, modelName, true)
 		return types.ActionContinue
 	}
 
-	// Step 3: Extract API key from auth header
-	authHeader, err := proxywasm.GetHttpRequestHeader(config.authHeaderName)
-	if err != nil || authHeader == "" {
-		log.Warnf("auth header %q is missing", config.authHeaderName)
-		return deniedMissingAuthHeader(config.authHeaderName)
+	// Non-whitelist: require valid API key
+	if authErr != nil {
+		log.Warnf("auth failed: %v", authErr)
+		return authErr.toResponse(config.authHeaderName)
 	}
 
-	apiKey, err := extractAPIKey(authHeader, config.authHeaderName)
-	if err != nil {
-		log.Warnf("failed to extract API key: %v", err)
-		return deniedInvalidAuthFormat(config.authHeaderName)
-	}
-
-	// Step 4: Validate API key exists
-	allowedModels, exists := config.apiKeyModels[apiKey]
-	if !exists {
-		log.Warnf("API key not found in configuration")
-		return deniedInvalidAPIKey()
-	}
-
-	// Step 5: Validate model access
-	if !contains(allowedModels, modelName) {
+	// Verify model access permission
+	if !contains(keyConfig.Models, modelName) {
 		log.Warnf("model %q not allowed for this API key", modelName)
 		return deniedModelAccessDenied(modelName)
 	}
 
-	// Authentication successful
-	log.Infof("auth success: model=%s", modelName)
+	// Success
+	setConsumerHeader(keyConfig, log, modelName, false)
 	return types.ActionContinue
+}
+
+// authError represents an authentication error with its type.
+type authError struct {
+	errType string
+	message string
+}
+
+func (e *authError) Error() string { return e.message }
+
+func (e *authError) toResponse(headerName string) types.Action {
+	switch e.errType {
+	case "missing_header":
+		return deniedMissingAuthHeader(headerName)
+	case "invalid_format":
+		return deniedInvalidAuthFormat(headerName)
+	default:
+		return deniedInvalidAPIKey()
+	}
+}
+
+// getKeyConfig extracts API key from header and returns the corresponding config.
+func (c *ModelAuthConfig) getKeyConfig(authHeaderName string) (*APIKeyConfig, *authError) {
+	authHeader, err := proxywasm.GetHttpRequestHeader(authHeaderName)
+	if err != nil || authHeader == "" {
+		return nil, &authError{"missing_header", "auth header is missing"}
+	}
+
+	apiKey, err := extractAPIKey(authHeader, authHeaderName)
+	if err != nil {
+		return nil, &authError{"invalid_format", err.Error()}
+	}
+
+	keyConfig, exists := c.apiKeyModels[apiKey]
+	if !exists {
+		return nil, &authError{"invalid_key", "API key not found"}
+	}
+
+	return keyConfig, nil
+}
+
+// setConsumerHeader sets x-mse-consumer header if keyConfig has a name.
+func setConsumerHeader(keyConfig *APIKeyConfig, log log.Log, modelName string, isWhitelisted bool) {
+	if keyConfig != nil && keyConfig.Name != "" {
+		_ = proxywasm.ReplaceHttpRequestHeader("x-mse-consumer", keyConfig.Name)
+		if isWhitelisted {
+			log.Infof("whitelisted model=%s, consumer=%s", modelName, keyConfig.Name)
+		} else {
+			log.Infof("auth success: model=%s, consumer=%s", modelName, keyConfig.Name)
+		}
+	} else if isWhitelisted {
+		log.Infof("whitelisted model=%s", modelName)
+	}
 }
 
 // ============================================================================
