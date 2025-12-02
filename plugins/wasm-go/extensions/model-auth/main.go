@@ -67,8 +67,8 @@ func init() {
 type APIKeyConfig struct {
 	// @Title Consumer 名称
 	// @Title en-US Consumer Name
-	// @Description 该 API Key 对应的 consumer 名称，会被设置到 x-mse-consumer header 中。
-	// @Description en-US The consumer name for this API key, will be set to x-mse-consumer header.
+	// @Description 该 API Key 对应的 consumer 名称，会被设置到 x-api-key-name header 中。
+	// @Description en-US The consumer name for this API key, will be set to x-api-key-name header.
 	Name string
 
 	// @Title 允许访问的模型列表
@@ -303,10 +303,10 @@ func (c *ModelAuthConfig) getKeyConfig(authHeaderName string) (*APIKeyConfig, *a
 	return keyConfig, nil
 }
 
-// setConsumerHeader sets x-mse-consumer header if keyConfig has a name.
+// setConsumerHeader sets x-api-key-name header if keyConfig has a name.
 func setConsumerHeader(keyConfig *APIKeyConfig, log log.Log, modelName string, isWhitelisted bool) {
 	if keyConfig != nil && keyConfig.Name != "" {
-		_ = proxywasm.ReplaceHttpRequestHeader("x-mse-consumer", keyConfig.Name)
+		_ = proxywasm.ReplaceHttpRequestHeader("x-api-key-name", keyConfig.Name)
 		if isWhitelisted {
 			log.Infof("whitelisted model=%s, consumer=%s", modelName, keyConfig.Name)
 		} else {

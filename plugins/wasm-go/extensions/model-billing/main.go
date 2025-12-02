@@ -88,6 +88,11 @@ func parsePathSuffixes(json gjson.Result, key string) []string {
 
 // onHttpRequestHeaders handles the request headers phase.
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig, log log.Log) types.Action {
+	// If x-api-key-name header exists, replace x-mse-consumer header with its value
+	if apiKeyName, err := proxywasm.GetHttpRequestHeader("x-api-key-name"); err == nil && apiKeyName != "" {
+		proxywasm.ReplaceHttpRequestHeader("x-mse-consumer", apiKeyName)
+	}
+
 	path, _ := proxywasm.GetHttpRequestHeader(":path")
 	if !isPathEnabled(path, config.EnablePathSuffixes) {
 		log.Debugf("[%s] skipping path %s (not in enabled suffixes)", pluginName, path)

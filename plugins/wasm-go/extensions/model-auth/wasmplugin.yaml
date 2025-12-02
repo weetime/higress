@@ -11,7 +11,7 @@ metadata:
     higress.io/wasm-plugin-built-in: "false"
     higress.io/wasm-plugin-category: custom
     higress.io/wasm-plugin-name: model-auth
-    higress.io/wasm-plugin-version: 0.0.7
+    higress.io/wasm-plugin-version: 0.0.10
 spec:
   defaultConfig:
     # ========================================
@@ -19,7 +19,7 @@ spec:
     # ========================================
     # api_key_models: 定义 API Key 到允许的模型列表的映射关系
     # 格式: api_key_models 是一个对象，每个键是 API Key，值包含 name（consumer 名称）和 models（允许访问的模型列表）
-    # name 会被设置到 x-mse-consumer header 中，用于标识请求来源
+    # name 会被设置到 x-api-key-name header 中，用于标识请求来源
     api_key_models:
       sk-test:
         name: "test-consumer"
@@ -85,5 +85,5 @@ spec:
   # For local testing, use file:// URL
   # url: file:///opt/plugins/wasm-go/extensions/model-auth/plugin.wasm
   # For production, use OCI registry
-  url: oci://quanzhenglong.com/camp/model-auth:v0.0.9
+  url: oci://quanzhenglong.com/camp/model-auth:v0.0.10
 

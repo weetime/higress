@@ -11,7 +11,7 @@ metadata:
     higress.io/wasm-plugin-built-in: "false"
     higress.io/wasm-plugin-category: custom
     higress.io/wasm-plugin-name: model-billing
-    higress.io/wasm-plugin-version: 0.0.2
+    higress.io/wasm-plugin-version: 0.0.3
 spec:
   defaultConfig:
     # ========================================
@@ -43,4 +43,4 @@ spec:
   # For local testing, use file:// URL
   # url: file:///opt/plugins/wasm-go/extensions/model-billing/plugin.wasm
   # For production, use OCI registry
-  url: oci://quanzhenglong.com/camp/model-billing:v0.0.2
+  url: oci://quanzhenglong.com/camp/model-billing:v0.0.3
