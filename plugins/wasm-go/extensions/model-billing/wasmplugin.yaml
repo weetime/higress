@@ -1,0 +1,46 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: model-billing.rise.io
+  namespace: higress-system
+  annotations:
+    higress.io/wasm-plugin-description: AI 计费插件，默认不计费，黑名单前缀匹配需要计费，白名单模型不计费。
+    higress.io/wasm-plugin-title: model-billing
+  labels:
+    higress.io/resource-definer: higress
+    higress.io/wasm-plugin-built-in: "false"
+    higress.io/wasm-plugin-category: custom
+    higress.io/wasm-plugin-name: model-billing
+    higress.io/wasm-plugin-version: 0.0.2
+spec:
+  defaultConfig:
+    # ========================================
+    # 配置项
+    # ========================================
+    # model_whitelist: 模型名称白名单列表
+    # 完全匹配该列表的模型请求将直接放行，不进行处理
+    # 默认值: []
+    model_whitelist: []
+
+    # model_blacklist_prefixes: 模型名称黑名单前缀列表
+    # 包含该前缀的模型请求将会被处理（补充 usage 信息）
+    # 默认值: ["gen-studio"]
+    model_blacklist_prefixes:
+    - "gen-studio"
+
+    # enable_path_suffixes: 启用的路径后缀列表
+    # 只有匹配这些后缀的请求才会被插件处理
+    # 默认值: ["/v1/chat/completions"]
+    enable_path_suffixes:
+    - "/v1/chat/completions"
+
+  matchRules: []
+  defaultConfigDisable: false
+  failStrategy: FAIL_OPEN
+  imagePullPolicy: IfNotPresent
+  phase: STATS
+  priority: 10
+  # For local testing, use file:// URL
+  # url: file:///opt/plugins/wasm-go/extensions/model-billing/plugin.wasm
+  # For production, use OCI registry
+  url: oci://quanzhenglong.com/camp/model-billing:v0.0.2

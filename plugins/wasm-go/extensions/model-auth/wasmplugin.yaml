@@ -85,5 +85,5 @@ spec:
   # For local testing, use file:// URL
   # url: file:///opt/plugins/wasm-go/extensions/model-auth/plugin.wasm
   # For production, use OCI registry
-  url: oci://quanzhenglong.com/camp/model-auth:v0.0.7
+  url: oci://quanzhenglong.com/camp/model-auth:v0.0.9
 
