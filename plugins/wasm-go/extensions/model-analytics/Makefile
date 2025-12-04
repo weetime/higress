@@ -1,10 +1,10 @@
-# Model Billing Plugin Makefile
-# This Makefile simplifies building and pushing the model-billing plugin
+# Model Analytics Plugin Makefile
+# This Makefile simplifies building and pushing the model-analytics plugin
 
 # Plugin configuration
-PLUGIN_NAME := model-billing
+PLUGIN_NAME := model-analytics
 REGISTRY ?= quanzhenglong.com/camp/
-VERSION ?= v0.0.2
+VERSION ?= v0.0.1
 IMG ?= ${REGISTRY}${PLUGIN_NAME}:${VERSION}
 
 # Parent directory containing the main Makefile
@@ -13,7 +13,7 @@ PARENT_DIR := ../..
 # Default target
 .PHONY: help
 help:
-	@echo "Model Billing Plugin Build Targets:"
+	@echo "Model Analytics Plugin Build Targets:"
 	@echo "  make build        - Build the plugin wasm file"
 	@echo "  make build-image  - Build the plugin docker image"
 	@echo "  make build-push   - Build and push the plugin docker image"
@@ -27,8 +27,8 @@ help:
 	@echo ""
 	@echo "Examples:"
 	@echo "  make build-push"
-	@echo "  make build-push VERSION=v0.0.2"
-	@echo "  make build-push IMG=myregistry.com/model-billing:latest"
+	@echo "  make build-push VERSION=v0.0.1"
+	@echo "  make build-push IMG=myregistry.com/model-analytics:latest"
 
 # Build the plugin wasm file
 .PHONY: build

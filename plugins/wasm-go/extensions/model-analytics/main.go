@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	pluginName = "model-billing"
+	pluginName = "model-analytics"
 
 	// Context keys
 	ctxKeySkipProcessing = "skip_processing"

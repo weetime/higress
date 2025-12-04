@@ -1,4 +1,4 @@
-module github.com/alibaba/higress/plugins/wasm-go/extensions/model-billing
+module github.com/alibaba/higress/plugins/wasm-go/extensions/model-analytics
 
 go 1.24.1
 

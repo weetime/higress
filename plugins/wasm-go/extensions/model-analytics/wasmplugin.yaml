@@ -1,17 +1,17 @@
 apiVersion: extensions.higress.io/v1alpha1
 kind: WasmPlugin
 metadata:
-  name: model-billing.rise.io
+  name: model-analytics.rise.io
   namespace: higress-system
   annotations:
-    higress.io/wasm-plugin-description: AI 计费插件，默认不计费，黑名单前缀匹配需要计费，白名单模型不计费。
-    higress.io/wasm-plugin-title: model-billing
+    higress.io/wasm-plugin-description: 模型计量统计分析插件，默认不计量，黑名单前缀匹配需要计量，白名单模型不纳入计量。
+    higress.io/wasm-plugin-title: model-analytics
   labels:
     higress.io/resource-definer: higress
     higress.io/wasm-plugin-built-in: "false"
     higress.io/wasm-plugin-category: custom
-    higress.io/wasm-plugin-name: model-billing
-    higress.io/wasm-plugin-version: 0.0.3
+    higress.io/wasm-plugin-name: model-analytics
+    higress.io/wasm-plugin-version: 0.0.1
 spec:
   defaultConfig:
     # ========================================
@@ -41,6 +41,6 @@ spec:
   phase: STATS
   priority: 10
   # For local testing, use file:// URL
-  # url: file:///opt/plugins/wasm-go/extensions/model-billing/plugin.wasm
+  # url: file:///opt/plugins/wasm-go/extensions/model-analytics/plugin.wasm
   # For production, use OCI registry
-  url: oci://quanzhenglong.com/camp/model-billing:v0.0.3
+  url: oci://quanzhenglong.com/camp/model-analytics:v0.0.1
