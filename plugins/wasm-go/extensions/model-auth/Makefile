@@ -4,7 +4,7 @@
 # Plugin configuration
 PLUGIN_NAME := model-auth
 REGISTRY ?= quanzhenglong.com/camp/
-VERSION ?= v0.0.1
+VERSION ?= latest
 IMG ?= ${REGISTRY}${PLUGIN_NAME}:${VERSION}
 
 # Parent directory containing the main Makefile
@@ -27,7 +27,7 @@ help:
 	@echo ""
 	@echo "Examples:"
 	@echo "  make build-push"
-	@echo "  make build-push VERSION=v0.0.2"
+	@echo "  make build-push VERSION=latest"
 	@echo "  make build-push IMG=myregistry.com/model-auth:latest"
 
 # Build the plugin wasm file

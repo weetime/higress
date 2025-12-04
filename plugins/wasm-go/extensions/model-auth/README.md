@@ -2,37 +2,195 @@
 
 ## 功能说明
 
-`model-auth` 是一个 Higress WASM 插件，用于对 LLM 请求进行精细化的访问控制。插件验证请求中的 API Key 是否有权限访问特定的模型。
+`model-auth` 是一个 Higress WASM 插件，基于**租户和工作空间**的多级权限模型，为 LLM 模型请求提供精细化的访问控制。
 
 ## 功能特性
 
-- 验证 `Authorization` 头中的 Bearer Token（API Key）
-- 验证 `x-higress-llm-model` 头中的模型名称
-- 基于白名单控制每个 API Key 可以访问的模型
-- 认证失败时返回 401 状态码及详细错误信息
+- ✅ 基于租户（Tenant）和用户（username）的多级权限控制
+- ✅ 支持模型级别的访问控制（哪些租户可以访问哪些模型）
+- ✅ 支持租户级别的用户管理（每个租户包含哪些用户）
+- ✅ 支持通配符 `"*"` 允许所有用户访问特定模型
+- ✅ 灵活的配置：只对配置的模型进行鉴权，未配置的模型直接放行
+- ✅ 自动设置 `x-api-key-name` header 标识用户身份
+- ✅ 认证失败返回详细的错误信息（401/403）
+
+---
+
+## 核心概念
+
+### 三层映射关系
+
+插件使用三层映射来实现灵活的权限控制：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       鉴权流程架构                                │
+└─────────────────────────────────────────────────────────────────┘
+
+   Request Headers
+   ├─ Authorization: Bearer sk-test
+   └─ x-higress-llm-model: model-a
+          │
+          ▼
+   ┌──────────────────────┐
+   │  1. model_mapping    │  模型 → 允许访问的租户列表
+   └──────────────────────┘
+          │
+          ├─ "*" → 所有用户都可以访问
+          └─ ["tenant-1", "tenant-2"] → 只有特定租户的用户可访问
+          │
+          ▼
+   ┌──────────────────────┐
+   │ 2. api_key_mapping   │  API Key → 用户名
+   └──────────────────────┘
+          │
+          └─ sk-test → user-1
+          │
+          ▼
+   ┌──────────────────────┐
+   │ 3. workspace_mapping │  租户 → 用户列表
+   └──────────────────────┘
+          │
+          └─ tenant-1: [user-1, user-2]
+          │
+          ▼
+   ┌──────────────────────┐
+   │   权限验证通过 ✅     │
+   └──────────────────────┘
+```
+
+### 1. model_mapping（模型映射）
+
+定义每个模型允许哪些**租户**访问：
+
+```yaml
+model_mapping:
+  model-public:
+    - "*"                    # 所有用户都可以访问
+  model-enterprise:
+    - "tenant-1"             # 只有 tenant-1 和 tenant-2 的用户可以访问
+    - "tenant-2"
+```
+
+### 2. api_key_mapping（API Key 映射）
+
+定义每个 API Key 对应的**用户名**：
+
+```yaml
+api_key_mapping:
+  sk-test: "user-1"         # sk-test 对应用户 user-1
+  sk-prod: "user-2"         # sk-prod 对应用户 user-2
+```
+
+### 3. workspace_mapping（工作空间映射）
+
+定义每个租户包含哪些**用户**：
+
+```yaml
+workspace_mapping:
+  tenant-1:
+    - "user-1"              # tenant-1 包含 user-1 和 user-2
+    - "user-2"
+  tenant-2:
+    - "user-3"              # tenant-2 包含 user-3
+```
+
+---
+
+## 完整鉴权流程
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       详细鉴权流程                                │
+└─────────────────────────────────────────────────────────────────┘
+
+Step 1: 获取模型名称
+├─ 从 request header 读取 model_header_name（默认 x-higress-llm-model）
+└─ 如果没有 model header → 🟢 跳过鉴权，直接放行
+
+Step 2: 检查模型是否归本插件管理
+├─ 检查 model 是否在 model_mapping 中
+└─ 如果不在 → 🟢 跳过鉴权，直接放行（该模型不归本插件管理）
+
+Step 3: 获取并验证 API Key
+├─ 从 request header 读取 auth_header_name（默认 Authorization）
+├─ 如果缺少 auth header → 🔴 返回 401 "Authorization header is required"
+├─ 提取 API Key（如果是 Authorization header，需要 Bearer Token 格式）
+└─ 如果格式错误 → 🔴 返回 401 "Invalid Authorization header format"
+
+Step 4: 获取用户并设置身份标识
+├─ 从 api_key_mapping[apiKey] 获取 userName
+├─ 如果 API Key 不存在 → 🔴 返回 401 "Invalid API key"
+├─ 设置 x-api-key-name header = userName + apiKey后8位
+└─ 记录用户身份用于后续验证
+
+Step 5: 检查通配符权限
+├─ 从 model_mapping[model] 获取 allowedTenants
+├─ 如果 allowedTenants = ["*"]
+│   ├─ 🟢 通配符模式，所有用户都可以访问
+│   └─ ✅ 鉴权通过，放行请求
+└─ 否则 → 继续 Step 6
+
+Step 6: 验证用户租户权限
+├─ 遍历 allowedTenants 列表
+├─ 对每个 tenant，从 workspace_mapping[tenant] 获取 users
+├─ 检查 userName 是否在 users 列表中
+│   ├─ 如果找到 → ✅ 鉴权通过，放行请求
+│   └─ 如果未找到 → 继续检查下一个 tenant
+└─ 如果所有 tenant 都不包含该用户 → 🔴 返回 403 "Access denied"
+
+┌─────────────────────────────────────────────────────────────────┐
+│                       返回结果                                    │
+└─────────────────────────────────────────────────────────────────┘
+
+✅ 鉴权成功：
+   - 请求继续转发到后端服务
+   - x-api-key-name header 已设置为 userName + apiKey后8位
+
+🔴 鉴权失败：
+   - 401: 缺少认证信息、格式错误、无效的 API Key
+   - 403: 用户没有权限访问该模型
+```
+
+---
 
 ## 配置说明
 
+### 配置项
+
 | 配置项 | 类型 | 必填 | 默认值 | 说明 |
 |--------|------|------|--------|------|
-| api_key_models | object | 是 | - | API Key 到允许访问的模型列表的映射 |
+| model_mapping | object | 是 | - | 模型到允许访问的租户列表的映射 |
+| workspace_mapping | object | 是 | - | 租户到用户列表的映射 |
+| api_key_mapping | object | 是 | - | API Key 到用户名的映射 |
 | auth_header_name | string | 否 | Authorization | 用于读取 API Key 的请求头名称 |
 | model_header_name | string | 否 | x-higress-llm-model | 用于读取模型名称的请求头名称 |
 
 ### 配置格式
 
 ```yaml
-api_key_models:
-  <api-key>:
-    - <model-name-1>
-    - <model-name-2>
-auth_header_name: "Authorization"  # 可选，默认为 "Authorization"
-model_header_name: "x-higress-llm-model"  # 可选，默认为 "x-higress-llm-model"
+model_mapping:
+  <model-name>:
+    - "*"                    # 或者特定租户列表
+    - "<tenant-name>"
+
+workspace_mapping:
+  <tenant-name>:
+    - "<user-name-1>"
+    - "<user-name-2>"
+
+api_key_mapping:
+  <api-key>: "<user-name>"
+
+auth_header_name: "Authorization"      # 可选
+model_header_name: "x-higress-llm-model" # 可选
 ```
+
+---
 
 ## 配置示例
 
-### 基本配置
+### 示例 1：基本配置
 
 ```yaml
 apiVersion: extensions.higress.io/v1alpha1
@@ -42,21 +200,34 @@ metadata:
   namespace: higress-system
 spec:
   defaultConfig:
-    api_key_models:
-      sk-test:
-        - "gen-studio-Qwen2.5-0.5B-Instruct-bbbb"
-      sk-weetime:
-        - "gen-studio-Qwen2.5-0.5B-Instruct-bbbb"
-        - "gen-studio-Qwen2.5-0.5B-Instruct-aaa"
-      sk-audio:
-        - "a1"
-        - "a2"
-  url: oci://<your_registry_hub>/model-auth:2.0.0
+    # 模型映射：定义每个模型允许哪些租户访问
+    model_mapping:
+      qwen-turbo:
+        - "*"                              # 所有用户都可以访问
+      qwen-plus:
+        - "enterprise-tenant"              # 只有企业租户可以访问
+        - "premium-tenant"
+      qwen-max:
+        - "enterprise-tenant"              # 只有企业租户可以访问
+
+    # 工作空间映射：定义每个租户包含哪些用户
+    workspace_mapping:
+      enterprise-tenant:
+        - "alice"
+        - "bob"
+      premium-tenant:
+        - "charlie"
+
+    # API Key 映射：定义每个 API Key 对应的用户
+    api_key_mapping:
+      sk-alice-key: "alice"
+      sk-bob-key: "bob"
+      sk-charlie-key: "charlie"
+
+  url: oci://quanzhenglong.com/camp/model-auth:v0.0.10
 ```
 
-### 使用自定义请求头名称
-
-如果你希望使用不同的请求头名称（例如 `X-API-Key` 和 `X-Model-Name`），可以这样配置：
+### 示例 2：多租户场景
 
 ```yaml
 apiVersion: extensions.higress.io/v1alpha1
@@ -66,81 +237,377 @@ metadata:
   namespace: higress-system
 spec:
   defaultConfig:
-    api_key_models:
-      sk-test:
-        - "model-1"
-    auth_header_name: "X-API-Key"
-    model_header_name: "X-Model-Name"
-  url: oci://<your_registry_hub>/model-auth:2.0.0
+    model_mapping:
+      # 公共模型
+      gpt-3.5-turbo:
+        - "*"
+      
+      # 部门专用模型
+      finance-model:
+        - "finance-dept"
+      hr-model:
+        - "hr-dept"
+      
+      # 跨部门共享模型
+      analytics-model:
+        - "finance-dept"
+        - "marketing-dept"
+
+    workspace_mapping:
+      finance-dept:
+        - "finance-user-1"
+        - "finance-user-2"
+        - "finance-admin"
+      hr-dept:
+        - "hr-user-1"
+        - "hr-manager"
+      marketing-dept:
+        - "marketing-user-1"
+        - "marketing-lead"
+
+    api_key_mapping:
+      sk-finance-1: "finance-user-1"
+      sk-finance-2: "finance-user-2"
+      sk-finance-admin: "finance-admin"
+      sk-hr-1: "hr-user-1"
+      sk-hr-mgr: "hr-manager"
+      sk-mkt-1: "marketing-user-1"
+      sk-mkt-lead: "marketing-lead"
+
+  url: oci://quanzhenglong.com/camp/model-auth:v0.0.10
 ```
 
-### 按路由配置
+### 示例 3：使用自定义请求头
 
 ```yaml
 spec:
   defaultConfig:
-    api_key_models:
-      sk-default:
-        - "model-1"
+    model_mapping:
+      custom-model:
+        - "custom-tenant"
+
+    workspace_mapping:
+      custom-tenant:
+        - "user-a"
+
+    api_key_mapping:
+      sk-custom: "user-a"
+
+    # 自定义请求头名称
+    auth_header_name: "X-API-Key"        # 使用自定义 API Key header
+    model_header_name: "X-Model-Name"    # 使用自定义模型 header
+
+  url: oci://quanzhenglong.com/camp/model-auth:v0.0.10
+```
+
+### 示例 4：按路由配置
+
+```yaml
+spec:
+  # 默认配置
+  defaultConfig:
+    model_mapping:
+      default-model:
+        - "default-tenant"
+    workspace_mapping:
+      default-tenant:
+        - "default-user"
+    api_key_mapping:
+      sk-default: "default-user"
+
+  # 路由级别配置（覆盖默认配置）
   matchRules:
   - config:
-      api_key_models:
-        sk-custom:
-          - "model-2"
-          - "model-3"
+      model_mapping:
+        route-specific-model:
+          - "special-tenant"
+      workspace_mapping:
+        special-tenant:
+          - "special-user"
+      api_key_mapping:
+        sk-special: "special-user"
     ingress:
     - my-custom-route
 ```
 
+---
+
 ## 使用示例
 
-### 成功认证
+### 场景 1：访问公共模型（通配符）
 
 ```bash
-curl -H "Authorization: Bearer sk-test" \
-     -H "x-higress-llm-model: gen-studio-Qwen2.5-0.5B-Instruct-bbbb" \
+# 使用 alice 的 API Key 访问公共模型（允许所有用户）
+curl -H "Authorization: Bearer sk-alice-key" \
+     -H "x-higress-llm-model: qwen-turbo" \
      http://your-gateway/v1/chat/completions
+
+# ✅ 成功：qwen-turbo 配置为 "*"，所有用户都可以访问
+# x-api-key-name: alice12345678 (alice + API Key后8位)
 ```
 
-### 常见错误响应
-
-| 场景 | 返回信息 |
-|------|----------|
-| 缺少 Authorization 头 | `{"error": "Authorization header is required"}` |
-| Authorization 格式错误 | `{"error": "Invalid Authorization header format. Expected: Authorization: Bearer <apiKey>"}` |
-| 缺少模型头 | `{"error": "x-higress-llm-model header is required"}` |
-| 无效的 API Key | `{"error": "Invalid API key"}` |
-| 模型未授权 | `{"error": "Model access denied for this API key"}` |
-
-## 构建说明
+### 场景 2：访问租户专属模型
 
 ```bash
-cd plugins/wasm-go && PLUGIN_NAME=model-auth IMG=quanzhenglong.com/camp/model-auth:v0.0.1  make build-push
+# alice (enterprise-tenant) 访问企业模型
+curl -H "Authorization: Bearer sk-alice-key" \
+     -H "x-higress-llm-model: qwen-plus" \
+     http://your-gateway/v1/chat/completions
+
+# ✅ 成功：alice 属于 enterprise-tenant，有权访问 qwen-plus
 ```
 
-## 安全建议
+### 场景 3：跨租户访问被拒绝
 
-1. **保护 API Keys**
-   - 不要将 API Key 硬编码在客户端代码中
-   - 使用环境变量或密钥管理系统存储 API Keys
-   - 使用 HTTPS 来保护传输中的 API Key
+```bash
+# charlie (premium-tenant) 尝试访问企业专属模型
+curl -H "Authorization: Bearer sk-charlie-key" \
+     -H "x-higress-llm-model: qwen-max" \
+     http://your-gateway/v1/chat/completions
 
-2. **定期轮换**
-   - 定期轮换 API Keys
-   - 为不同的用户或应用使用不同的 API Keys
+# ❌ 失败 403：charlie 不属于 enterprise-tenant，无权访问 qwen-max
+# {"error":"User charlie is not authorized to access model: qwen-max"}
+```
 
-3. **最小权限原则**
-   - 只为 API Key 授予访问必要模型的权限
-   - 定期审查和清理不再使用的 API Keys
+### 场景 4：访问未配置的模型
 
-4. **监控和日志**
-   - 监控未授权的访问尝试
-   - 启用审计日志记录所有认证事件
+```bash
+# 访问不在 model_mapping 中的模型
+curl -H "Authorization: Bearer sk-alice-key" \
+     -H "x-higress-llm-model: unknown-model" \
+     http://your-gateway/v1/chat/completions
+
+# ✅ 直接放行：unknown-model 不在配置中，插件跳过鉴权
+```
+
+---
+
+## 错误响应
+
+| HTTP 状态码 | 错误类型 | 返回信息 | 场景 |
+|------------|---------|----------|------|
+| 401 | missing_auth_header | `{"error":"Authorization header is required"}` | 缺少 Authorization 头 |
+| 401 | invalid_auth_format | `{"error":"Invalid Authorization header format"}` | Authorization 格式错误（不是 Bearer Token） |
+| 401 | invalid_api_key | `{"error":"Invalid API key"}` | API Key 不在 api_key_mapping 中 |
+| 403 | access_denied | `{"error":"User {user} is not authorized to access model: {model}"}` | 用户所属租户无权访问该模型 |
+
+---
+
+## 鉴权流程验证表
+
+根据上面的配置示例，各场景的鉴权结果：
+
+| API Key | 用户 | 模型 | 允许的租户 | 用户所属租户 | 结果 |
+|---------|------|------|------------|--------------|------|
+| sk-alice-key | alice | qwen-turbo | ["*"] | - | ✅ 通过（通配符）|
+| sk-alice-key | alice | qwen-plus | ["enterprise-tenant", "premium-tenant"] | enterprise-tenant | ✅ 通过 |
+| sk-alice-key | alice | qwen-max | ["enterprise-tenant"] | enterprise-tenant | ✅ 通过 |
+| sk-charlie-key | charlie | qwen-turbo | ["*"] | - | ✅ 通过（通配符）|
+| sk-charlie-key | charlie | qwen-plus | ["enterprise-tenant", "premium-tenant"] | premium-tenant | ✅ 通过 |
+| sk-charlie-key | charlie | qwen-max | ["enterprise-tenant"] | premium-tenant | ❌ 403 拒绝 |
+| sk-invalid | - | qwen-turbo | - | - | ❌ 401 无效 Key |
+| sk-alice-key | alice | unknown-model | (不存在) | - | ✅ 跳过鉴权 |
+
+---
+
+## 构建和部署
+
+### 本地构建
+
+```bash
+cd plugins/wasm-go
+PLUGIN_NAME=model-auth IMG=quanzhenglong.com/camp/model-auth:v0.0.11 make build-push
+```
+
+### 应用配置
+
+```bash
+# 应用 WasmPlugin 配置
+kubectl apply -f wasmplugin.yaml
+
+# 查看插件状态
+kubectl get wasmplugin model-auth -n higress-system
+
+# 查看插件日志
+kubectl logs -n higress-system -l app=higress-gateway --tail=100 | grep model-auth
+```
+
+---
+
+## 最佳实践
+
+### 1. 权限设计原则
+
+- **最小权限原则**：只为用户授予访问必要模型的权限
+- **租户隔离**：不同租户之间的模型访问应该相互隔离
+- **公共资源使用通配符**：对于所有用户都可以访问的模型，使用 `"*"` 通配符
+
+### 2. API Key 管理
+
+- **不要硬编码**：不要将 API Key 硬编码在客户端代码中
+- **使用密钥管理系统**：使用 Kubernetes Secret 或外部密钥管理系统存储配置
+- **定期轮换**：定期轮换 API Keys，并更新配置
+- **一用户一密钥**：为每个用户分配独立的 API Key
+
+### 3. 租户管理
+
+- **清晰的命名**：使用有意义的租户名称（如 `finance-dept`, `enterprise-tenant`）
+- **定期审计**：定期审查租户成员和权限配置
+- **文档化**：维护租户和用户的映射关系文档
+
+### 4. 模型配置
+
+- **分级管理**：将模型按访问级别分类（公共、部门、企业等）
+- **渐进式开放**：新模型先限制访问，稳定后再考虑扩大范围
+- **未配置模型放行**：利用"未配置模型直接放行"特性，只配置需要控制的模型
+
+### 5. 安全加固
+
+```yaml
+# 推荐：使用 Kubernetes Secret 存储敏感配置
+apiVersion: v1
+kind: Secret
+metadata:
+  name: model-auth-config
+  namespace: higress-system
+type: Opaque
+stringData:
+  config.yaml: |
+    api_key_mapping:
+      sk-secret-key-1: "user-1"
+      sk-secret-key-2: "user-2"
+---
+# 在 WasmPlugin 中引用 Secret
+# （注：这需要 Higress 支持从 Secret 读取配置）
+```
+
+### 6. 监控和告警
+
+建议监控以下指标：
+- 401/403 错误率（可能表示配置问题或攻击）
+- API Key 使用频率（检测异常使用）
+- 模型访问模式（了解使用情况）
+
+### 7. HTTPS 保护
+
+⚠️ **始终使用 HTTPS**：API Key 在请求头中传输，必须使用 HTTPS 保护传输安全
+
+---
 
 ## 故障排除
 
-| 问题 | 解决方案 |
-|------|----------|
-| 总是返回 401 | 检查 `Authorization` 头格式（必须是 `Bearer <token>`）<br>检查 API Key 是否在 `api_key_models` 配置中 |
-| 某些模型无法访问 | 验证 `x-higress-llm-model` 头的值与配置中的模型名称完全匹配（区分大小写）<br>确认该模型在对应 API Key 的允许列表中 |
-| 配置更新后不生效 | WasmPlugin 配置更新可能需要几秒钟才能生效<br>可通过 `kubectl get wasmplugin model-auth -n higress-system` 检查状态 |
+### 问题 1：总是返回 401 "Invalid API key"
+
+**可能原因**：
+- API Key 不在 `api_key_mapping` 配置中
+- Authorization header 格式错误
+
+**解决方案**：
+```bash
+# 1. 检查 Authorization header 格式（必须是 Bearer Token）
+curl -v -H "Authorization: Bearer sk-test" ...
+
+# 2. 检查 API Key 是否在配置中
+kubectl get wasmplugin model-auth -n higress-system -o yaml | grep api_key_mapping -A 10
+
+# 3. 查看插件日志
+kubectl logs -n higress-system -l app=higress-gateway | grep "API key not found"
+```
+
+### 问题 2：返回 403 "Access denied"
+
+**可能原因**：
+- 用户不属于模型允许的任何租户
+- 租户配置错误
+
+**解决方案**：
+```bash
+# 1. 确认模型的允许租户列表
+# model_mapping[model] 中的租户
+
+# 2. 确认用户属于哪个租户
+# workspace_mapping 中查找包含该用户的租户
+
+# 3. 确认租户匹配
+# 用户的租户必须在模型的允许租户列表中
+```
+
+### 问题 3：某些模型无法访问，但应该可以
+
+**可能原因**：
+- 模型名称大小写不匹配
+- 配置更新未生效
+
+**解决方案**：
+```bash
+# 1. 检查模型名称完全匹配（区分大小写）
+# x-higress-llm-model header 的值必须与 model_mapping 中的 key 完全一致
+
+# 2. 等待配置生效（通常需要几秒钟）
+kubectl get wasmplugin model-auth -n higress-system -o yaml
+
+# 3. 强制重启 gateway pod
+kubectl rollout restart deployment higress-gateway -n higress-system
+```
+
+### 问题 4：未配置的模型也被拦截
+
+**可能原因**：
+- 理解错误，插件应该跳过未配置的模型
+
+**解决方案**：
+```bash
+# 检查日志，应该看到 "not managed by this plugin, skipping"
+kubectl logs -n higress-system -l app=higress-gateway | grep "not managed by this plugin"
+
+# 如果没有此日志，可能是模型名称恰好匹配了配置中的某个模型
+```
+
+### 问题 5：配置更新后不生效
+
+**解决方案**：
+```bash
+# 1. 确认配置已更新
+kubectl get wasmplugin model-auth -n higress-system -o yaml
+
+# 2. 查看 WasmPlugin 状态
+kubectl describe wasmplugin model-auth -n higress-system
+
+# 3. 重启 gateway
+kubectl rollout restart deployment higress-gateway -n higress-system
+
+# 4. 查看日志确认新配置已加载
+kubectl logs -n higress-system -l app=higress-gateway --tail=50 | grep "loaded"
+```
+
+---
+
+## 版本历史
+
+- **v0.0.11**: 基于租户和工作空间的多级权限模型
+  - 移除 `api_key_models` 和 `whitelist` 配置
+  - 新增 `model_mapping`、`workspace_mapping`、`api_key_mapping`
+  - 支持通配符 `"*"` 允许所有用户访问
+  - 未配置的模型直接放行，不进行鉴权
+  - 自动设置 `x-api-key-name` header（用户名 + API Key 后8位）
+
+- **v0.0.7**: 初始版本
+  - 基于 API Key 和模型白名单的访问控制
+
+---
+
+## 技术支持
+
+如有问题或建议，请通过以下方式联系：
+
+- 📧 Email: admin@higress.io
+- 🌐 Website: http://higress.io/
+- 💬 GitHub Issues: https://github.com/alibaba/higress/issues
+
+---
+
+## License
+
+Copyright (c) 2022 Alibaba Group Holding Ltd.
+
+Licensed under the Apache License, Version 2.0

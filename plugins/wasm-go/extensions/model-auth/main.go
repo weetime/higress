@@ -63,68 +63,64 @@ func init() {
 // Configuration Types
 // ============================================================================
 
-// APIKeyConfig represents the configuration for a single API key.
-type APIKeyConfig struct {
-	// @Title Consumer 名称
-	// @Title en-US Consumer Name
-	// @Description 该 API Key 对应的 consumer 名称，会被设置到 x-api-key-name header 中。
-	// @Description en-US The consumer name for this API key, will be set to x-api-key-name header.
-	Name string
-
-	// @Title 允许访问的模型列表
-	// @Title en-US Allowed Models
-	// @Description 该 API Key 允许访问的模型列表。
-	// @Description en-US The list of models that this API key is allowed to access.
-	Models []string
-}
-
 // @Name model-auth
 // @Category auth
 // @Phase AUTHN
 // @Priority 300
 // @Title zh-CN 模型访问认证
 // @Title en-US Model Access Authentication
-// @Description zh-CN 本插件实现了基于 API Key 的模型访问控制功能，可以限制不同 API Key 访问特定的 LLM 模型。
-// @Description en-US This plugin implements model access control based on API Key, restricting different API keys to access specific LLM models.
+// @Description zh-CN 本插件实现了基于 API Key、租户和工作空间的模型访问控制功能。
+// @Description en-US This plugin implements model access control based on API Key, tenants and workspaces.
 // @IconUrl https://img.alicdn.com/imgextra/i4/O1CN01BPFGlT1pGZ2VDLgaH_!!6000000005333-2-tps-42-42.png
-// @Version 0.0.7
+// @Version 0.0.11
 //
 // @Contact.name Higress Team
 // @Contact.url http://higress.io/
 // @Contact.email admin@higress.io
 //
 // @Example
-// api_key_models:
+// model_mapping:
 //
-//	sk-test:
-//	  name: weetime/ai-for-deployer
-//	  models:
-//	    - model-a
-//	    - model-b
-//	sk-prod:
-//	  name: prod-consumer
-//	  models:
-//	    - model-c
+//	model-a:
+//	  - "*"
+//	model-b:
+//	  - "tenant-1"
+//	  - "tenant-2"
 //
-// whitelist:
-//   - model-public
-//   - model-free
+// workspace_mapping:
+//
+//	tenant-1:
+//	  - "user-1"
+//	  - "user-2"
+//	tenant-2:
+//	  - "user-3"
+//
+// api_key_mapping:
+//
+//	sk-test: "user-1"
+//	sk-prod: "user-2"
 //
 // auth_header_name: Authorization
 // model_header_name: x-higress-llm-model
 // @End
 type ModelAuthConfig struct {
-	// @Title API Key 与模型的映射关系
-	// @Title en-US API Key to Models Mapping
-	// @Description key 为 API Key，value 为该 Key 的配置（包含 name 和 models）。
-	// @Description en-US Key is the API key, value is the configuration (including name and models).
-	apiKeyModels map[string]*APIKeyConfig
+	// @Title 模型到租户的映射关系
+	// @Title en-US Model to Tenants Mapping
+	// @Description 模型名称到允许访问的租户列表的映射。如果租户列表包含 "*"，则所有用户都可以访问。
+	// @Description en-US Mapping from model name to list of allowed tenants. If tenant list contains "*", all users can access.
+	modelMapping map[string][]string
 
-	// @Title 模型白名单
-	// @Title en-US Model Whitelist
-	// @Description 白名单中的模型无需认证，直接放行。
-	// @Description en-US Models in the whitelist are allowed without authentication.
-	whitelist []string
+	// @Title 租户到用户的映射关系
+	// @Title en-US Tenant to Users Mapping
+	// @Description 租户名称到该租户下用户列表的映射。
+	// @Description en-US Mapping from tenant name to list of users in that tenant.
+	workspaceMapping map[string][]string
+
+	// @Title API Key 到用户的映射关系
+	// @Title en-US API Key to User Mapping
+	// @Description API Key 到用户名的映射关系。
+	// @Description en-US Mapping from API Key to user name.
+	apiKeyMapping map[string]string
 
 	// @Title 认证头名称
 	// @Title en-US Auth Header Name
@@ -148,22 +144,25 @@ type ModelAuthConfig struct {
 // Configuration format:
 //
 //	{
-//	  "api_key_models": {
-//	    "sk-test": {
-//	      "name": "weetime/ai-for-deployer",
-//	      "models": ["model-a", "model-b"]
-//	    },
-//	    "sk-prod": {
-//	      "name": "prod-consumer",
-//	      "models": ["model-c", "model-d"]
-//	    }
+//	  "model_mapping": {
+//	    "model-a": ["*"],
+//	    "model-b": ["tenant-1", "tenant-2"]
+//	  },
+//	  "workspace_mapping": {
+//	    "tenant-1": ["user-1", "user-2"],
+//	    "tenant-2": ["user-3"]
+//	  },
+//	  "api_key_mapping": {
+//	    "sk-test": "user-1",
+//	    "sk-prod": "user-2"
 //	  },
 //	  "auth_header_name": "Authorization",
 //	  "model_header_name": "x-higress-llm-model"
 //	}
 func parseConfig(json gjson.Result, config *ModelAuthConfig, log log.Log) error {
-	config.apiKeyModels = make(map[string]*APIKeyConfig)
-	config.whitelist = make([]string, 0)
+	config.modelMapping = make(map[string][]string)
+	config.workspaceMapping = make(map[string][]string)
+	config.apiKeyMapping = make(map[string]string)
 
 	// Parse auth_header_name (optional)
 	config.authHeaderName = json.Get("auth_header_name").String()
@@ -177,49 +176,70 @@ func parseConfig(json gjson.Result, config *ModelAuthConfig, log log.Log) error 
 		config.modelHeaderName = defaultModelHeaderName
 	}
 
-	// Parse whitelist (optional)
-	whitelistJson := json.Get("whitelist")
-	if whitelistJson.Exists() && whitelistJson.IsArray() {
-		for _, model := range whitelistJson.Array() {
-			config.whitelist = append(config.whitelist, model.String())
-		}
-		log.Infof("loaded whitelist with %d models: %v", len(config.whitelist), config.whitelist)
-	}
-
 	log.Infof("config: auth_header=%s, model_header=%s", config.authHeaderName, config.modelHeaderName)
 
-	// Parse api_key_models (required)
-	apiKeyModelsJson := json.Get("api_key_models")
-	if !apiKeyModelsJson.Exists() {
-		return errors.New("api_key_models is required")
+	// Parse model_mapping (required)
+	modelMappingJson := json.Get("model_mapping")
+	if !modelMappingJson.Exists() {
+		return errors.New("model_mapping is required")
 	}
 
-	apiKeyModelsJson.ForEach(func(key, value gjson.Result) bool {
-		apiKey := key.String()
-		keyConfig := &APIKeyConfig{}
-
-		// Parse name (required)
-		keyConfig.Name = value.Get("name").String()
-		if keyConfig.Name == "" {
-			// Fallback to apiKey as name if not specified
-			keyConfig.Name = apiKey
-		}
-
-		// Parse models
-		modelsJson := value.Get("models")
-		if modelsJson.Exists() && modelsJson.IsArray() {
-			for _, model := range modelsJson.Array() {
-				keyConfig.Models = append(keyConfig.Models, model.String())
+	modelMappingJson.ForEach(func(key, value gjson.Result) bool {
+		modelName := key.String()
+		tenants := make([]string, 0)
+		if value.IsArray() {
+			for _, tenant := range value.Array() {
+				tenants = append(tenants, tenant.String())
 			}
 		}
-
-		config.apiKeyModels[apiKey] = keyConfig
-		log.Debugf("loaded API key %q with name=%s, %d models", apiKey, keyConfig.Name, len(keyConfig.Models))
+		config.modelMapping[modelName] = tenants
+		log.Debugf("loaded model %q with %d tenants: %v", modelName, len(tenants), tenants)
 		return true
 	})
 
-	if len(config.apiKeyModels) == 0 {
-		return errors.New("api_key_models cannot be empty")
+	if len(config.modelMapping) == 0 {
+		return errors.New("model_mapping cannot be empty")
+	}
+
+	// Parse workspace_mapping (required)
+	workspaceMappingJson := json.Get("workspace_mapping")
+	if !workspaceMappingJson.Exists() {
+		return errors.New("workspace_mapping is required")
+	}
+
+	workspaceMappingJson.ForEach(func(key, value gjson.Result) bool {
+		tenant := key.String()
+		users := make([]string, 0)
+		if value.IsArray() {
+			for _, user := range value.Array() {
+				users = append(users, user.String())
+			}
+		}
+		config.workspaceMapping[tenant] = users
+		log.Debugf("loaded tenant %q with %d users: %v", tenant, len(users), users)
+		return true
+	})
+
+	if len(config.workspaceMapping) == 0 {
+		return errors.New("workspace_mapping cannot be empty")
+	}
+
+	// Parse api_key_mapping (required)
+	apiKeyMappingJson := json.Get("api_key_mapping")
+	if !apiKeyMappingJson.Exists() {
+		return errors.New("api_key_mapping is required")
+	}
+
+	apiKeyMappingJson.ForEach(func(key, value gjson.Result) bool {
+		apiKey := key.String()
+		userName := value.String()
+		config.apiKeyMapping[apiKey] = userName
+		log.Debugf("loaded API key %q -> user %q", apiKey, userName)
+		return true
+	})
+
+	if len(config.apiKeyMapping) == 0 {
+		return errors.New("api_key_mapping cannot be empty")
 	}
 
 	return nil
@@ -231,90 +251,73 @@ func parseConfig(json gjson.Result, config *ModelAuthConfig, log log.Log) error 
 
 // onHttpRequestHeaders handles the HTTP request headers for model authentication.
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config ModelAuthConfig, log log.Log) types.Action {
-	// Get model name from header, skip if not present
+	// Step 1: Get model name from header, skip if not present
 	modelName, err := proxywasm.GetHttpRequestHeader(config.modelHeaderName)
 	if err != nil || modelName == "" {
 		log.Debugf("model header %q not found, skipping", config.modelHeaderName)
 		return types.ActionContinue
 	}
 
-	// Try to get keyConfig from auth header (needed for consumer header)
-	keyConfig, authErr := config.getKeyConfig(config.authHeaderName)
-
-	// Whitelist check: allow access, but still set consumer if available
-	if contains(config.whitelist, modelName) {
-		setConsumerHeader(keyConfig, log, modelName, true)
+	// Step 2: Check if model is managed by this plugin
+	allowedTenants, exists := config.modelMapping[modelName]
+	if !exists {
+		log.Debugf("model %q not found in model_mapping, not managed by this plugin, skipping", modelName)
 		return types.ActionContinue
 	}
 
-	// Non-whitelist: require valid API key
-	if authErr != nil {
-		log.Warnf("auth failed: %v", authErr)
-		return authErr.toResponse(config.authHeaderName)
+	// Step 3: Get API key from header
+	authHeader, err := proxywasm.GetHttpRequestHeader(config.authHeaderName)
+	if err != nil || authHeader == "" {
+		log.Warnf("auth header %q is missing", config.authHeaderName)
+		return deniedMissingAuthHeader(config.authHeaderName)
 	}
 
-	// Verify model access permission
-	if !contains(keyConfig.Models, modelName) {
-		log.Warnf("model %q not allowed for this API key", modelName)
-		return deniedModelAccessDenied(modelName)
+	apiKey, err := extractAPIKey(authHeader, config.authHeaderName)
+	if err != nil {
+		log.Warnf("invalid auth format: %v", err)
+		return deniedInvalidAuthFormat(config.authHeaderName)
 	}
 
-	// Success
-	setConsumerHeader(keyConfig, log, modelName, false)
-	return types.ActionContinue
-}
+	// Step 4: Get user from API key and set consumer header
+	userName, userExists := config.apiKeyMapping[apiKey]
 
-// authError represents an authentication error with its type.
-type authError struct {
-	errType string
-	message string
-}
-
-func (e *authError) Error() string { return e.message }
-
-func (e *authError) toResponse(headerName string) types.Action {
-	switch e.errType {
-	case "missing_header":
-		return deniedMissingAuthHeader(headerName)
-	case "invalid_format":
-		return deniedInvalidAuthFormat(headerName)
-	default:
+	if !userExists {
+		log.Warnf("API key not found in api_key_mapping")
 		return deniedInvalidAPIKey()
 	}
-}
 
-// getKeyConfig extracts API key from header and returns the corresponding config.
-func (c *ModelAuthConfig) getKeyConfig(authHeaderName string) (*APIKeyConfig, *authError) {
-	authHeader, err := proxywasm.GetHttpRequestHeader(authHeaderName)
-	if err != nil || authHeader == "" {
-		return nil, &authError{"missing_header", "auth header is missing"}
+	// Set consumer header with username + last 8 chars of API key (or full key if shorter)
+	apiKeySuffix := apiKey
+	if len(apiKey) > 8 {
+		apiKeySuffix = apiKey[len(apiKey)-8:]
+	}
+	_ = proxywasm.ReplaceHttpRequestHeader("x-api-key-name", userName+apiKeySuffix)
+	log.Debugf("set consumer header: user=%s", userName)
+
+	// Step 5: Check if model allows all users (wildcard "*")
+	if len(allowedTenants) == 1 && allowedTenants[0] == "*" {
+		log.Infof("auth success: model=%s, user=%s (wildcard)", modelName, userName)
+		return types.ActionContinue
 	}
 
-	apiKey, err := extractAPIKey(authHeader, authHeaderName)
-	if err != nil {
-		return nil, &authError{"invalid_format", err.Error()}
-	}
-
-	keyConfig, exists := c.apiKeyModels[apiKey]
-	if !exists {
-		return nil, &authError{"invalid_key", "API key not found"}
-	}
-
-	return keyConfig, nil
-}
-
-// setConsumerHeader sets x-api-key-name header if keyConfig has a name.
-func setConsumerHeader(keyConfig *APIKeyConfig, log log.Log, modelName string, isWhitelisted bool) {
-	if keyConfig != nil && keyConfig.Name != "" {
-		_ = proxywasm.ReplaceHttpRequestHeader("x-api-key-name", keyConfig.Name)
-		if isWhitelisted {
-			log.Infof("whitelisted model=%s, consumer=%s", modelName, keyConfig.Name)
-		} else {
-			log.Infof("auth success: model=%s, consumer=%s", modelName, keyConfig.Name)
+	// Step 7: Check if user belongs to any of the allowed tenants
+	for _, tenant := range allowedTenants {
+		users, exists := config.workspaceMapping[tenant]
+		if !exists {
+			log.Debugf("tenant %q not found in workspace_mapping", tenant)
+			continue
 		}
-	} else if isWhitelisted {
-		log.Infof("whitelisted model=%s", modelName)
+
+		if contains(users, userName) {
+			// User is authorized
+			log.Infof("auth success: model=%s, user=%s, tenant=%s", modelName, userName, tenant)
+			return types.ActionContinue
+		}
 	}
+
+	// User not authorized for any of the allowed tenants
+	log.Warnf("user %q not authorized for model %q (allowed tenants: %v)", userName, modelName, allowedTenants)
+	return deniedAccessDenied(modelName, userName)
 }
 
 // ============================================================================
@@ -395,13 +398,13 @@ func deniedInvalidAPIKey() types.Action {
 	return types.ActionContinue
 }
 
-// deniedModelAccessDenied returns 403 when model access is not allowed.
-func deniedModelAccessDenied(modelName string) types.Action {
+// deniedAccessDenied returns 403 when user is not authorized to access the model.
+func deniedAccessDenied(modelName, userName string) types.Action {
 	_ = proxywasm.SendHttpResponseWithDetail(
 		http.StatusForbidden,
-		pluginName+".model_access_denied",
+		pluginName+".access_denied",
 		responseHeaders(),
-		[]byte(fmt.Sprintf(`{"error":"Access denied for model: %s"}`, modelName)),
+		[]byte(fmt.Sprintf(`{"error":"User %s is not authorized to access model: %s"}`, userName, modelName)),
 		-1,
 	)
 	return types.ActionContinue

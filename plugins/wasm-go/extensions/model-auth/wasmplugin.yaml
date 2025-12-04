@@ -11,67 +11,76 @@ metadata:
     higress.io/wasm-plugin-built-in: "false"
     higress.io/wasm-plugin-category: custom
     higress.io/wasm-plugin-name: model-auth
-    higress.io/wasm-plugin-version: 0.0.10
+    higress.io/wasm-plugin-version: 0.0.11
 spec:
   defaultConfig:
     # ========================================
-    # 必填配置项
+    # 必填配置项：模型映射配置
     # ========================================
-    # api_key_models: 定义 API Key 到允许的模型列表的映射关系
-    # 格式: api_key_models 是一个对象，每个键是 API Key，值包含 name（consumer 名称）和 models（允许访问的模型列表）
-    # name 会被设置到 x-api-key-name header 中，用于标识请求来源
-    api_key_models:
-      sk-test:
-        name: "test-consumer"
-        models:
-          - "gen-studio-Qwen2.5-0.5B-Instruct-bbbb"
-      sk-weetime:
-        name: "weetime/ai-for-deployer"
-        models:
-          - "gen-studio-Qwen2.5-0.5B-Instruct-bbbb"
-          - "gen-studio-Qwen2.5-0.5B-Instruct-aaa"
-      sk-audio:
-        name: "audio-consumer"
-        models:
-          - "a1"
-          - "a2"
+    # model_mapping: 模型到租户的映射关系
+    # 格式: 模型名称 -> 允许访问的租户列表
+    # 如果租户列表包含 "*"，则所有用户都可以访问该模型
+    # 如果租户列表为空数组，则没有任何用户可以访问该模型
+    # 如果租户列表为字符串数组，则只有这些租户中的用户可以访问该模型
+    # 请求示例: x-higress-llm-model: gen-studio-Qwen2.5-0.5B-Instruct-bbbb
+    model_mapping:
+      gen-studio-Qwen2.5-0.5B-Instruct-bbbb:
+        - "*"
+      gen-studio-Qwen2.5-0.5B-Instruct-aaa:
+        - "ai-for-deployer"
+        - "test-tenant"
+      ai-for-deployer-Qwen2.5-0.5B-Instruct-aaa:
+        - "ai-for-deployer"
+
     # ========================================
-    # 可选配置项：模型白名单
+    # 必填配置项：租户映射配置
     # ========================================
-    # whitelist: 白名单中的模型无需认证，直接放行
-    # 格式: 字符串数组，包含无需认证的模型名称
-    whitelist:
-      - "model-public"
-      - "model-free"
-    model_header_name: "x-higress-llm-model"
-    auth_header_name: "x-api-key"
+    # workspace_mapping: 租户到用户的映射关系
+    # 格式: 租户名称 -> 该租户下的用户列表
+    workspace_mapping:
+      ai-for-deployer:
+        - "admin"
+        - "weetime"
+      test-tenant:
+        - "test-tenant"
+
+    # ========================================
+    # 必填配置项：API Key 映射配置
+    # ========================================
+    # api_key_mapping: API Key 到用户的映射关系
+    # 格式: API Key -> 用户名
+    # 用户名会被设置到 x-api-key-name header 中，用于标识请求来源
+    api_key_mapping:
+      sk-test: "admin"
+      sk-prod: "weetime"
     # ========================================
     # 可选配置项：自定义请求头名称
     # ========================================
-    # auth_header_name: 指定从哪个请求头读取 API Key（Bearer Token）
+    # auth_header_name: 指定从哪个请求头读取 API Key
     #   - 默认值: "Authorization"
-    #   - 如果不设置，将使用默认值 "Authorization"
-    #   - 请求示例: Authorization: Bearer sk-test
+    #   - 如果使用 "Authorization"，需要 Bearer Token 格式: Authorization: Bearer sk-test
+    #   - 如果使用自定义头（如 "X-API-Key"），直接使用值: X-API-Key: sk-test
     #
     # model_header_name: 指定从哪个请求头读取模型名称
     #   - 默认值: "x-higress-llm-model"
-    #   - 如果不设置，将使用默认值 "x-higress-llm-model"
     #   - 请求示例: x-higress-llm-model: gen-studio-Qwen2.5-0.5B-Instruct-bbbb
     
     # 取消下面两行注释可以使用自定义请求头名称：
-    # auth_header_name: "X-API-Key"
-    # model_header_name: "X-Model-Name"
+    # auth_header_name: "Authorization"
+    # model_header_name: "x-higress-llm-model"
     
   matchRules:
   # - config:
   #     # Per-route configuration can override the default
   #     # 路由级别配置可以覆盖默认配置
-  #     api_key_models:
-  #       sk-custom:
-  #         name: "custom-consumer"
-  #         models:
-  #           - "model-1"
-  #           - "model-2"
+  #     model_mapping:
+  #       custom-model:
+  #         - "custom-tenant"
+  #     workspace_mapping:
+  #       custom-tenant:
+  #         - "custom-user"
+  #     api_key_mapping:
+  #       sk-custom: "custom-user"
   #     # 也可以在路由级别自定义请求头名称
   #     # auth_header_name: "X-Route-API-Key"
   #     # model_header_name: "X-Route-Model"
@@ -85,5 +94,5 @@ spec:
   # For local testing, use file:// URL
   # url: file:///opt/plugins/wasm-go/extensions/model-auth/plugin.wasm
   # For production, use OCI registry
-  url: oci://quanzhenglong.com/camp/model-auth:v0.0.10
+  url: oci://quanzhenglong.com/camp/model-auth:v0.0.11
 
