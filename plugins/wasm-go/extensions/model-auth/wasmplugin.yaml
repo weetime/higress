@@ -11,7 +11,7 @@ metadata:
     higress.io/wasm-plugin-built-in: "false"
     higress.io/wasm-plugin-category: custom
     higress.io/wasm-plugin-name: model-auth
-    higress.io/wasm-plugin-version: 0.0.11
+    higress.io/wasm-plugin-version: 0.0.13
 spec:
   defaultConfig:
     # ========================================
@@ -47,12 +47,16 @@ spec:
     # ========================================
     # 必填配置项：API Key 映射配置
     # ========================================
-    # api_key_mapping: API Key 到用户的映射关系
-    # 格式: API Key -> 用户名
+    # api_key_mapping: 用户到 API Key 列表的映射关系
+    # 格式: 用户名 -> API Key 数组
     # 用户名会被设置到 x-api-key-name header 中，用于标识请求来源
+    # 一个用户可以拥有多个 API Key
     api_key_mapping:
-      sk-test: "admin"
-      sk-prod: "weetime"
+      admin:
+        - "sk-02a69aa1-df0e-4ecb-8e02-a0b832d56295"
+        - "sk-1d25a264-fad1-46de-95e7-54621d827d7e"
+      weetime:
+        - "sk-e377ddd2-88f2-47cb-9e2c-fe174dca1bd0"
     # ========================================
     # 可选配置项：自定义请求头名称
     # ========================================
@@ -80,7 +84,9 @@ spec:
   #       custom-tenant:
   #         - "custom-user"
   #     api_key_mapping:
-  #       sk-custom: "custom-user"
+  #       custom-user:
+  #         - "sk-custom-key-1"
+  #         - "sk-custom-key-2"
   #     # 也可以在路由级别自定义请求头名称
   #     # auth_header_name: "X-Route-API-Key"
   #     # model_header_name: "X-Route-Model"
@@ -94,5 +100,5 @@ spec:
   # For local testing, use file:// URL
   # url: file:///opt/plugins/wasm-go/extensions/model-auth/plugin.wasm
   # For production, use OCI registry
-  url: oci://quanzhenglong.com/camp/model-auth:v0.0.11
+  url: oci://quanzhenglong.com/camp/model-auth:v0.0.13
 

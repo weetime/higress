@@ -72,7 +72,7 @@ func init() {
 // @Description zh-CN 本插件实现了基于 API Key、租户和工作空间的模型访问控制功能。
 // @Description en-US This plugin implements model access control based on API Key, tenants and workspaces.
 // @IconUrl https://img.alicdn.com/imgextra/i4/O1CN01BPFGlT1pGZ2VDLgaH_!!6000000005333-2-tps-42-42.png
-// @Version 0.0.11
+// @Version 0.0.13
 //
 // @Contact.name Higress Team
 // @Contact.url http://higress.io/
@@ -97,8 +97,11 @@ func init() {
 //
 // api_key_mapping:
 //
-//	sk-test: "user-1"
-//	sk-prod: "user-2"
+//	user-1:
+//	  - "sk-02a69aa1-df0e-4ecb-8e02-a0b832d56295"
+//	  - "sk-1d25a264-fad1-46de-95e7-54621d827d7e"
+//	user-2:
+//	  - "sk-e377ddd2-88f2-47cb-9e2c-fe174dca1bd0"
 //
 // auth_header_name: Authorization
 // model_header_name: x-higress-llm-model
@@ -153,8 +156,8 @@ type ModelAuthConfig struct {
 //	    "tenant-2": ["user-3"]
 //	  },
 //	  "api_key_mapping": {
-//	    "sk-test": "user-1",
-//	    "sk-prod": "user-2"
+//	    "user-1": ["sk-key-1", "sk-key-2"],
+//	    "user-2": ["sk-key-3"]
 //	  },
 //	  "auth_header_name": "Authorization",
 //	  "model_header_name": "x-higress-llm-model"
@@ -225,16 +228,21 @@ func parseConfig(json gjson.Result, config *ModelAuthConfig, log log.Log) error 
 	}
 
 	// Parse api_key_mapping (required)
+	// Configuration format: username -> []apiKey
+	// Internal storage: apiKey -> username (for fast lookup)
 	apiKeyMappingJson := json.Get("api_key_mapping")
 	if !apiKeyMappingJson.Exists() {
 		return errors.New("api_key_mapping is required")
 	}
 
 	apiKeyMappingJson.ForEach(func(key, value gjson.Result) bool {
-		apiKey := key.String()
-		userName := value.String()
-		config.apiKeyMapping[apiKey] = userName
-		log.Debugf("loaded API key %q -> user %q", apiKey, userName)
+		userName := key.String()
+		if value.IsArray() {
+			for _, apiKey := range value.Array() {
+				apiKeyStr := apiKey.String()
+				config.apiKeyMapping[apiKeyStr] = userName
+			}
+		}
 		return true
 	})
 
@@ -291,7 +299,7 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config ModelAuthConfig, log l
 	if len(apiKey) > 8 {
 		apiKeySuffix = apiKey[len(apiKey)-8:]
 	}
-	_ = proxywasm.ReplaceHttpRequestHeader("x-api-key-name", userName+apiKeySuffix)
+	_ = proxywasm.ReplaceHttpRequestHeader("x-api-key-name", userName+"/"+apiKeySuffix)
 	log.Debugf("set consumer header: user=%s", userName)
 
 	// Step 5: Check if model allows all users (wildcard "*")

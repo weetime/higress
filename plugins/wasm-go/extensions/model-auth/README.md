@@ -41,10 +41,11 @@
           │
           ▼
    ┌──────────────────────┐
-   │ 2. api_key_mapping   │  API Key → 用户名
+   │ 2. api_key_mapping   │  用户 → API Key 列表
    └──────────────────────┘
           │
-          └─ sk-test → user-1
+          └─ user-1: [sk-key-1, sk-key-2]
+             (内部反向映射为 sk-key-1 → user-1)
           │
           ▼
    ┌──────────────────────┐
@@ -74,12 +75,15 @@ model_mapping:
 
 ### 2. api_key_mapping（API Key 映射）
 
-定义每个 API Key 对应的**用户名**：
+定义每个用户拥有的 **API Key 列表**（一个用户可以有多个 API Key）：
 
 ```yaml
 api_key_mapping:
-  sk-test: "user-1"         # sk-test 对应用户 user-1
-  sk-prod: "user-2"         # sk-prod 对应用户 user-2
+  user-1:                   # 用户 user-1 拥有以下 API Keys
+    - "sk-02a69aa1-df0e-4ecb-8e02-a0b832d56295"
+    - "sk-1d25a264-fad1-46de-95e7-54621d827d7e"
+  user-2:                   # 用户 user-2 拥有以下 API Key
+    - "sk-e377ddd2-88f2-47cb-9e2c-fe174dca1bd0"
 ```
 
 ### 3. workspace_mapping（工作空间映射）
@@ -162,7 +166,7 @@ Step 6: 验证用户租户权限
 |--------|------|------|--------|------|
 | model_mapping | object | 是 | - | 模型到允许访问的租户列表的映射 |
 | workspace_mapping | object | 是 | - | 租户到用户列表的映射 |
-| api_key_mapping | object | 是 | - | API Key 到用户名的映射 |
+| api_key_mapping | object | 是 | - | 用户名到 API Key 列表的映射（一个用户可以有多个 API Key） |
 | auth_header_name | string | 否 | Authorization | 用于读取 API Key 的请求头名称 |
 | model_header_name | string | 否 | x-higress-llm-model | 用于读取模型名称的请求头名称 |
 
@@ -180,7 +184,9 @@ workspace_mapping:
     - "<user-name-2>"
 
 api_key_mapping:
-  <api-key>: "<user-name>"
+  <user-name>:              # 用户名作为 key
+    - "<api-key-1>"         # 该用户的 API Key 列表
+    - "<api-key-2>"
 
 auth_header_name: "Authorization"      # 可选
 model_header_name: "x-higress-llm-model" # 可选
@@ -218,11 +224,15 @@ spec:
       premium-tenant:
         - "charlie"
 
-    # API Key 映射：定义每个 API Key 对应的用户
+    # API Key 映射：定义每个用户拥有的 API Key 列表
     api_key_mapping:
-      sk-alice-key: "alice"
-      sk-bob-key: "bob"
-      sk-charlie-key: "charlie"
+      alice:
+        - "sk-alice-key-1"
+        - "sk-alice-key-2"
+      bob:
+        - "sk-bob-key-1"
+      charlie:
+        - "sk-charlie-key-1"
 
   url: oci://quanzhenglong.com/camp/model-auth:v0.0.10
 ```
@@ -266,13 +276,21 @@ spec:
         - "marketing-lead"
 
     api_key_mapping:
-      sk-finance-1: "finance-user-1"
-      sk-finance-2: "finance-user-2"
-      sk-finance-admin: "finance-admin"
-      sk-hr-1: "hr-user-1"
-      sk-hr-mgr: "hr-manager"
-      sk-mkt-1: "marketing-user-1"
-      sk-mkt-lead: "marketing-lead"
+      finance-user-1:
+        - "sk-finance-1-key-1"
+        - "sk-finance-1-key-2"
+      finance-user-2:
+        - "sk-finance-2-key-1"
+      finance-admin:
+        - "sk-finance-admin-key-1"
+      hr-user-1:
+        - "sk-hr-1-key-1"
+      hr-manager:
+        - "sk-hr-mgr-key-1"
+      marketing-user-1:
+        - "sk-mkt-1-key-1"
+      marketing-lead:
+        - "sk-mkt-lead-key-1"
 
   url: oci://quanzhenglong.com/camp/model-auth:v0.0.10
 ```
@@ -291,7 +309,9 @@ spec:
         - "user-a"
 
     api_key_mapping:
-      sk-custom: "user-a"
+      user-a:
+        - "sk-custom-key-1"
+        - "sk-custom-key-2"
 
     # 自定义请求头名称
     auth_header_name: "X-API-Key"        # 使用自定义 API Key header
@@ -313,7 +333,8 @@ spec:
       default-tenant:
         - "default-user"
     api_key_mapping:
-      sk-default: "default-user"
+      default-user:
+        - "sk-default-key-1"
 
   # 路由级别配置（覆盖默认配置）
   matchRules:
@@ -325,7 +346,8 @@ spec:
         special-tenant:
           - "special-user"
       api_key_mapping:
-        sk-special: "special-user"
+        special-user:
+          - "sk-special-key-1"
     ingress:
     - my-custom-route
 ```
@@ -338,30 +360,41 @@ spec:
 
 ```bash
 # 使用 alice 的 API Key 访问公共模型（允许所有用户）
-curl -H "Authorization: Bearer sk-alice-key" \
+curl -H "Authorization: Bearer sk-alice-key-1" \
      -H "x-higress-llm-model: qwen-turbo" \
      http://your-gateway/v1/chat/completions
 
 # ✅ 成功：qwen-turbo 配置为 "*"，所有用户都可以访问
-# x-api-key-name: alice12345678 (alice + API Key后8位)
+# x-api-key-name: alice/key-1 (alice + "/" + API Key后8位)
 ```
 
 ### 场景 2：访问租户专属模型
 
 ```bash
-# alice (enterprise-tenant) 访问企业模型
-curl -H "Authorization: Bearer sk-alice-key" \
+# alice (enterprise-tenant) 访问企业模型，可以使用任何一个已配置的 API Key
+curl -H "Authorization: Bearer sk-alice-key-1" \
      -H "x-higress-llm-model: qwen-plus" \
      http://your-gateway/v1/chat/completions
 
 # ✅ 成功：alice 属于 enterprise-tenant，有权访问 qwen-plus
 ```
 
-### 场景 3：跨租户访问被拒绝
+### 场景 3：同一用户使用不同 API Key
+
+```bash
+# alice 使用第二个 API Key 访问
+curl -H "Authorization: Bearer sk-alice-key-2" \
+     -H "x-higress-llm-model: qwen-plus" \
+     http://your-gateway/v1/chat/completions
+
+# ✅ 成功：sk-alice-key-2 也属于 alice，权限相同
+```
+
+### 场景 4：跨租户访问被拒绝
 
 ```bash
 # charlie (premium-tenant) 尝试访问企业专属模型
-curl -H "Authorization: Bearer sk-charlie-key" \
+curl -H "Authorization: Bearer sk-charlie-key-1" \
      -H "x-higress-llm-model: qwen-max" \
      http://your-gateway/v1/chat/completions
 
@@ -369,11 +402,11 @@ curl -H "Authorization: Bearer sk-charlie-key" \
 # {"error":"User charlie is not authorized to access model: qwen-max"}
 ```
 
-### 场景 4：访问未配置的模型
+### 场景 5：访问未配置的模型
 
 ```bash
 # 访问不在 model_mapping 中的模型
-curl -H "Authorization: Bearer sk-alice-key" \
+curl -H "Authorization: Bearer sk-alice-key-1" \
      -H "x-higress-llm-model: unknown-model" \
      http://your-gateway/v1/chat/completions
 
@@ -399,14 +432,15 @@ curl -H "Authorization: Bearer sk-alice-key" \
 
 | API Key | 用户 | 模型 | 允许的租户 | 用户所属租户 | 结果 |
 |---------|------|------|------------|--------------|------|
-| sk-alice-key | alice | qwen-turbo | ["*"] | - | ✅ 通过（通配符）|
-| sk-alice-key | alice | qwen-plus | ["enterprise-tenant", "premium-tenant"] | enterprise-tenant | ✅ 通过 |
-| sk-alice-key | alice | qwen-max | ["enterprise-tenant"] | enterprise-tenant | ✅ 通过 |
-| sk-charlie-key | charlie | qwen-turbo | ["*"] | - | ✅ 通过（通配符）|
-| sk-charlie-key | charlie | qwen-plus | ["enterprise-tenant", "premium-tenant"] | premium-tenant | ✅ 通过 |
-| sk-charlie-key | charlie | qwen-max | ["enterprise-tenant"] | premium-tenant | ❌ 403 拒绝 |
-| sk-invalid | - | qwen-turbo | - | - | ❌ 401 无效 Key |
-| sk-alice-key | alice | unknown-model | (不存在) | - | ✅ 跳过鉴权 |
+| sk-alice-key-1 | alice | qwen-turbo | ["*"] | - | ✅ 通过（通配符）|
+| sk-alice-key-2 | alice | qwen-turbo | ["*"] | - | ✅ 通过（通配符）|
+| sk-alice-key-1 | alice | qwen-plus | ["enterprise-tenant", "premium-tenant"] | enterprise-tenant | ✅ 通过 |
+| sk-alice-key-1 | alice | qwen-max | ["enterprise-tenant"] | enterprise-tenant | ✅ 通过 |
+| sk-charlie-key-1 | charlie | qwen-turbo | ["*"] | - | ✅ 通过（通配符）|
+| sk-charlie-key-1 | charlie | qwen-plus | ["enterprise-tenant", "premium-tenant"] | premium-tenant | ✅ 通过 |
+| sk-charlie-key-1 | charlie | qwen-max | ["enterprise-tenant"] | premium-tenant | ❌ 403 拒绝 |
+| sk-invalid-key | - | qwen-turbo | - | - | ❌ 401 无效 Key |
+| sk-alice-key-1 | alice | unknown-model | (不存在) | - | ✅ 跳过鉴权 |
 
 ---
 
@@ -416,7 +450,7 @@ curl -H "Authorization: Bearer sk-alice-key" \
 
 ```bash
 cd plugins/wasm-go
-PLUGIN_NAME=model-auth IMG=quanzhenglong.com/camp/model-auth:v0.0.11 make build-push
+PLUGIN_NAME=model-auth IMG=quanzhenglong.com/camp/model-auth:latest make build-push
 ```
 
 ### 应用配置
@@ -447,7 +481,8 @@ kubectl logs -n higress-system -l app=higress-gateway --tail=100 | grep model-au
 - **不要硬编码**：不要将 API Key 硬编码在客户端代码中
 - **使用密钥管理系统**：使用 Kubernetes Secret 或外部密钥管理系统存储配置
 - **定期轮换**：定期轮换 API Keys，并更新配置
-- **一用户一密钥**：为每个用户分配独立的 API Key
+- **多密钥支持**：为每个用户分配多个 API Key，方便轮换和不同应用场景使用
+- **密钥隔离**：不同应用或环境使用不同的 API Key，便于追踪和撤销
 
 ### 3. 租户管理
 
@@ -583,6 +618,12 @@ kubectl logs -n higress-system -l app=higress-gateway --tail=50 | grep "loaded"
 ---
 
 ## 版本历史
+
+- **v0.0.12**: 优化 API Key 映射配置结构
+  - 修改 `api_key_mapping` 配置格式：从 `apiKey -> username` 改为 `username -> []apiKey`
+  - 支持一个用户拥有多个 API Key，便于密钥轮换和多应用场景
+  - 内部仍使用反向映射 `apiKey -> username` 保证查询性能
+  - `x-api-key-name` header 格式改为 `username/apiKeySuffix`（使用 `/` 分隔）
 
 - **v0.0.11**: 基于租户和工作空间的多级权限模型
   - 移除 `api_key_models` 和 `whitelist` 配置
