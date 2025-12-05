@@ -26,11 +26,6 @@ spec:
     model_mapping:
       gen-studio-Qwen2.5-0.5B-Instruct-bbbb:
         - "*"
-      gen-studio-Qwen2.5-0.5B-Instruct-aaa:
-        - "ai-for-deployer"
-        - "test-tenant"
-      ai-for-deployer-Qwen2.5-0.5B-Instruct-aaa:
-        - "ai-for-deployer"
 
     # ========================================
     # 必填配置项：租户映射配置
@@ -38,11 +33,9 @@ spec:
     # workspace_mapping: 租户到用户的映射关系
     # 格式: 租户名称 -> 该租户下的用户列表
     workspace_mapping:
-      ai-for-deployer:
+      test-tenant:
         - "admin"
         - "weetime"
-      test-tenant:
-        - "test-tenant"
 
     # ========================================
     # 必填配置项：API Key 映射配置
@@ -53,10 +46,10 @@ spec:
     # 一个用户可以拥有多个 API Key
     api_key_mapping:
       admin:
-        - "sk-02a69aa1-df0e-4ecb-8e02-a0b832d56295"
-        - "sk-1d25a264-fad1-46de-95e7-54621d827d7e"
+        - "sk-xxx"
+        - "sk-yyy"
       weetime:
-        - "sk-e377ddd2-88f2-47cb-9e2c-fe174dca1bd0"
+        - "sk-zzz"
     # ========================================
     # 可选配置项：自定义请求头名称
     # ========================================
