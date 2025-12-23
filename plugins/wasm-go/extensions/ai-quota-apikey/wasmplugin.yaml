@@ -1,0 +1,114 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-quota-apikey.rise.io
+  namespace: higress-system
+  annotations:
+    higress.io/wasm-plugin-description: 基于 API-Key 的 AI Token 配额管理插件，支持从请求头或查询参数提取 API-Key，根据分配的固定配额进行 Token 配额限流，同时支持配额查询、刷新、增减等管理功能。
+    higress.io/wasm-plugin-title: ai-quota-apikey
+  labels:
+    higress.io/resource-definer: higress
+    higress.io/wasm-plugin-built-in: "false"
+    higress.io/wasm-plugin-category: custom
+    higress.io/wasm-plugin-name: ai-quota-apikey
+    higress.io/wasm-plugin-version: 0.0.7
+spec:
+  defaultConfig:
+    # ========================================
+    # 必填配置项：Redis 配置
+    # ========================================
+    # redis: Redis 连接配置
+    #   service_name: Redis 服务名称，支持完整 FQDN（如 redis-service.default.svc.cluster.local）
+    #   service_port: Redis 服务端口，默认 6379（static service 默认为 80）
+    #   username: Redis 用户名（可选）
+    #   password: Redis 密码（可选）
+    #   timeout: Redis 连接超时时间，单位毫秒，默认 1000
+    #   database: Redis 数据库 ID，默认 0
+    redis:
+      service_name: redis-master.dns
+      service_port: 6379
+      timeout: 2000
+      # username: ""
+      # password: ""
+      # database: 0
+
+    # ========================================
+    # 必填配置项：管理 API-Key
+    # ========================================
+    # admin_api_key: 用于管理配额的管理员 API-Key
+    #   只有使用此 API-Key 的请求才能调用配额管理接口（查询、刷新、增减）
+    #   请求示例: Authorization: Bearer sk-admin-xxx
+    admin_api_key: "sk-admin"
+
+    # ========================================
+    # 可选配置项：Redis Key 前缀
+    # ========================================
+    # redis_key_prefix: Redis 中存储配额数据的 key 前缀
+    #   默认值: "chat_quota_apikey:"
+    #   最终 key 格式:
+    #   示例（带 route_name）: chat_quota_apikey_infer-e43c2026-052b-4544-82fd-38da299a2a4e:81d64d31b4db62c328aeef8da6b5a8f5c3ea516cb763976f5df2dde4db24a010
+    redis_key_prefix: "chat_quota_apikey"
+
+    # ========================================
+    # 可选配置项：管理路径
+    # ========================================
+    # admin_path: 配额管理接口的路径前缀
+    #   默认值: "/quota"
+    #   管理接口路径:
+    #     - 查询配额: /v1/chat/completions{admin_path}?api_key=xxx
+    #     - 刷新配额: /v1/chat/completions{admin_path}/refresh
+    #     - 增减配额: /v1/chat/completions{admin_path}/delta
+    admin_path: "/quota-manager"
+
+    # ========================================
+    # 可选配置项：API-Key 来源
+    # ========================================
+    # api_key_source: API-Key 的提取来源
+    #   可选值: "header" 或 "query"
+    #   默认值: "header"
+    #   - "header": 从请求头提取（推荐）
+    #   - "query": 从查询参数提取
+    api_key_source: "header"
+
+    # ========================================
+    # 可选配置项：API-Key Header 名称
+    # ========================================
+    # api_key_header_name: 当 api_key_source 为 "header" 时，指定从哪个请求头读取 API-Key
+    #   默认值: "Authorization"
+    #   - 如果使用 "Authorization"，需要 Bearer Token 格式: Authorization: Bearer sk-xxx
+    #   - 如果使用自定义头（如 "X-API-Key"），直接使用值: X-API-Key: sk-xxx
+    api_key_header_name: "Authorization"
+
+    # ========================================
+    # 可选配置项：API-Key Query 参数名称
+    # ========================================
+    # api_key_query_name: 当 api_key_source 为 "query" 时，指定查询参数的名称
+    #   默认值: "api_key"
+    #   请求示例: /v1/chat/completions?api_key=sk-xxx
+    # api_key_query_name: "api_key"
+
+    # ========================================
+    # 可选配置项：API-Key 哈希
+    # ========================================
+    # hash_api_key: 是否对 API-Key 进行 SHA256 哈希处理
+    #   默认值: false
+    #   推荐值: true（避免 Redis key 过长或包含特殊字符）
+    #   - true: Redis key 为 {prefix}{hash(api_key)}，固定长度 64 字符
+    #   - false: Redis key 为 {prefix}{api_key}，可能包含特殊字符
+    hash_api_key: false
+
+  matchRules: [] # 路由级别配置可以覆盖默认配置
+  # - config:
+  #     route_name: infer-e43c2026-052b-4544-82fd-38da299a2a4e
+  #   ingress:
+  #   - ai-route-example.internal
+  defaultConfigDisable: false
+  failStrategy: FAIL_CLOSE
+  imagePullPolicy: UNSPECIFIED_POLICY
+  phase: UNSPECIFIED_PHASE
+  priority: 280
+  # For local testing, use file:// URL
+  # url: file:///opt/plugins/wasm-go/extensions/ai-quota-apikey/plugin.wasm
+  # For production, use OCI registry
+  url: oci://quanzhenglong.com/camp/ai-quota-apikey:v0.0.7
+
