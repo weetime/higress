@@ -38,7 +38,7 @@ const (
 	ctxKeyChatMode       = "chatMode"
 	ctxKeyAdminMode      = "adminMode"
 	ctxKeyApiKey         = "apiKey"
-	ctxKeyRouteName      = "routeName"
+	ctxKeyRuleName       = "ruleName"
 	ctxKeyHasQuotaConfig = "hasQuotaConfig"
 	ctxKeyPresetQuota    = "presetQuota"    // 预设配额，在请求头阶段获取
 	ctxKeyRemainingQuota = "remainingQuota" // 当前剩余配额，在请求头阶段获取
@@ -89,7 +89,7 @@ type QuotaConfig struct {
 	HashApiKey       bool   // 是否对 API Key 进行哈希
 
 	// 路由配置
-	RouteName string // 从 matchRules 配置中获取的路由名称
+	RuleName string // 从 matchRules 配置中获取的规则名称
 }
 
 // RedisInfo Redis 连接信息
@@ -206,11 +206,11 @@ func parseConfig(json gjson.Result, config *QuotaConfig) error {
 	)
 }
 
-// parseRuleConfig 解析路由规则配置，继承全局配置并覆盖 route_name
+// parseRuleConfig 解析路由规则配置，继承全局配置并覆盖 rule_name
 func parseRuleConfig(json gjson.Result, global QuotaConfig, config *QuotaConfig) error {
 	*config = global
-	if routeName := json.Get("route_name").String(); routeName != "" {
-		config.RouteName = routeName
+	if ruleName := json.Get("rule_name").String(); ruleName != "" {
+		config.RuleName = ruleName
 	}
 	return nil
 }
@@ -283,13 +283,13 @@ func getApiKeyForHash(config QuotaConfig, apiKey string) string {
 // ============================================================================
 
 // getRedisKey 生成配额存储的 Redis Key
-// 格式: {prefix}_{route_name}:{api_key} 或 {prefix}{api_key}
-func getRedisKey(config QuotaConfig, apiKey string, routeName ...string) string {
+// 格式: {prefix}_{rule_name}:{api_key} 或 {prefix}{api_key}
+func getRedisKey(config QuotaConfig, apiKey string, ruleName ...string) string {
 	var route string
-	if len(routeName) > 0 && routeName[0] != "" {
-		route = routeName[0]
-	} else if config.RouteName != "" {
-		route = config.RouteName
+	if len(ruleName) > 0 && ruleName[0] != "" {
+		route = ruleName[0]
+	} else if config.RuleName != "" {
+		route = config.RuleName
 	}
 
 	keySuffix := apiKey
@@ -305,11 +305,11 @@ func getRedisKey(config QuotaConfig, apiKey string, routeName ...string) string 
 }
 
 // getTotalQuotaKey 生成 Hash 结构的 Redis Key
-// 格式: {prefix}_total_quota:{route_name}
-func getTotalQuotaKey(config QuotaConfig, routeName string) string {
+// 格式: {prefix}_total_quota:{rule_name}
+func getTotalQuotaKey(config QuotaConfig, ruleName string) string {
 	prefix := strings.TrimSuffix(config.RedisKeyPrefix, ":")
-	if routeName != "" {
-		return prefix + "_total_quota:" + routeName
+	if ruleName != "" {
+		return prefix + "_total_quota:" + ruleName
 	}
 	return prefix + "_total_quota"
 }
@@ -422,7 +422,7 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config QuotaConfig) types.Act
 	ctx.SetContext(ctxKeyChatMode, chatMode)
 	ctx.SetContext(ctxKeyAdminMode, adminMode)
 	ctx.SetContext(ctxKeyApiKey, apiKey)
-	ctx.SetContext(ctxKeyRouteName, config.RouteName)
+	ctx.SetContext(ctxKeyRuleName, config.RuleName)
 
 	log.Debugf("chatMode:%s, adminMode:%s, apiKey:%s", chatMode, adminMode, apiKey)
 
@@ -455,8 +455,8 @@ func handleAdminMode(ctx wrapper.HttpContext, config QuotaConfig, adminMode Admi
 // checkQuotaAndFetchPreset 检查配额并获取预设配额（保存到上下文供响应阶段使用）
 func checkQuotaAndFetchPreset(ctx wrapper.HttpContext, config QuotaConfig, apiKey string) types.Action {
 	redisKey := getRedisKey(config, apiKey)
-	routeName := config.RouteName
-	totalQuotaKey := getTotalQuotaKey(config, routeName)
+	ruleName := config.RuleName
+	totalQuotaKey := getTotalQuotaKey(config, ruleName)
 	apiKeyForHash := getApiKeyForHash(config, apiKey)
 
 	// 第一步：获取当前配额值
@@ -584,7 +584,7 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, da
 	// 执行配额更新
 	updateQuotaOnConsumption(ctx, config,
 		apiKey.(string),
-		ctx.GetContext(ctxKeyRouteName).(string),
+		ctx.GetContext(ctxKeyRuleName).(string),
 		int(inputToken.(int64)+outputToken.(int64)),
 	)
 
@@ -595,12 +595,12 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config QuotaConfig, da
 // 策略：完全使用 fire-and-forget 方式更新单个 Key 和 Hash
 // 注意：在 Proxy-WASM 的 onHttpStreamingResponseBody 中，Redis 回调不会执行
 // 因此所有值都从上下文中获取（在请求头阶段已保存）
-func updateQuotaOnConsumption(ctx wrapper.HttpContext, config QuotaConfig, apiKey, routeName string, totalToken int) {
-	redisKey := getRedisKey(config, apiKey, routeName)
-	totalQuotaKey := getTotalQuotaKey(config, routeName)
+func updateQuotaOnConsumption(ctx wrapper.HttpContext, config QuotaConfig, apiKey, ruleName string, totalToken int) {
+	redisKey := getRedisKey(config, apiKey, ruleName)
+	totalQuotaKey := getTotalQuotaKey(config, ruleName)
 	apiKeyForHash := getApiKeyForHash(config, apiKey)
 
-	log.Debugf("updateQuota: apiKey=%s, routeName=%s, totalToken=%d", apiKey, routeName, totalToken)
+	log.Debugf("updateQuota: apiKey=%s, ruleName=%s, totalToken=%d", apiKey, ruleName, totalToken)
 
 	// 1. 更新单个配额 Key（fire-and-forget，与 ai-quota 插件一致）
 	config.redisClient.DecrBy(redisKey, totalToken, nil)
@@ -658,14 +658,14 @@ func refreshQuota(ctx wrapper.HttpContext, config QuotaConfig, adminApiKey strin
 		return types.ActionContinue
 	}
 
-	routeName := values["route_name"]
-	if routeName == "" {
-		routeName = config.RouteName
+	ruleName := values["rule_name"]
+	if ruleName == "" {
+		ruleName = config.RuleName
 	}
 
 	// 生成 Redis Keys
-	redisKey := getRedisKey(config, queryApiKey, routeName)
-	totalQuotaKey := getTotalQuotaKey(config, routeName)
+	redisKey := getRedisKey(config, queryApiKey, ruleName)
+	totalQuotaKey := getTotalQuotaKey(config, ruleName)
 	apiKeyForHash := getApiKeyForHash(config, queryApiKey)
 	quotaValue := formatQuotaValue(quota, quota)
 
@@ -710,12 +710,12 @@ func listQuotas(ctx wrapper.HttpContext, config QuotaConfig, adminApiKey string,
 	}
 
 	// 获取路由名称
-	routeName := reqURL.Query().Get("route_name")
-	if routeName == "" {
-		routeName = config.RouteName
+	ruleName := reqURL.Query().Get("rule_name")
+	if ruleName == "" {
+		ruleName = config.RuleName
 	}
 
-	totalQuotaKey := getTotalQuotaKey(config, routeName)
+	totalQuotaKey := getTotalQuotaKey(config, ruleName)
 
 	err := config.redisClient.HGetAll(totalQuotaKey, func(response resp.Value) {
 		if err := response.Error(); err != nil {
@@ -723,7 +723,7 @@ func listQuotas(ctx wrapper.HttpContext, config QuotaConfig, adminApiKey string,
 			return
 		}
 
-		quotas := buildQuotaList(response, routeName)
+		quotas := buildQuotaList(response, ruleName)
 
 		body, err := json.Marshal(quotas)
 		if err != nil {
@@ -763,14 +763,14 @@ func deleteQuota(ctx wrapper.HttpContext, config QuotaConfig, adminApiKey string
 		return types.ActionContinue
 	}
 
-	routeName := values["route_name"]
-	if routeName == "" {
-		routeName = config.RouteName
+	ruleName := values["rule_name"]
+	if ruleName == "" {
+		ruleName = config.RuleName
 	}
 
 	// 生成 Redis Keys
-	redisKey := getRedisKey(config, queryApiKey, routeName)
-	totalQuotaKey := getTotalQuotaKey(config, routeName)
+	redisKey := getRedisKey(config, queryApiKey, ruleName)
+	totalQuotaKey := getTotalQuotaKey(config, ruleName)
 	apiKeyForHash := getApiKeyForHash(config, queryApiKey)
 
 	// 先删除单个配额 Key（即使 key 不存在也返回成功）
@@ -815,7 +815,7 @@ func deleteQuota(ctx wrapper.HttpContext, config QuotaConfig, adminApiKey string
 }
 
 // buildQuotaList 从 Redis HGetAll 响应构建配额列表
-func buildQuotaList(response resp.Value, routeName string) []map[string]interface{} {
+func buildQuotaList(response resp.Value, ruleName string) []map[string]interface{} {
 	if response.IsNull() {
 		return []map[string]interface{}{}
 	}
@@ -842,8 +842,8 @@ func buildQuotaList(response resp.Value, routeName string) []map[string]interfac
 			"preset_quota":    presetQuota,
 			"remaining_quota": remainingQuota,
 		}
-		if routeName != "" {
-			quotaInfo["route_name"] = routeName
+		if ruleName != "" {
+			quotaInfo["rule_name"] = ruleName
 		}
 		quotas = append(quotas, quotaInfo)
 	}

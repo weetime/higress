@@ -46,7 +46,7 @@ spec:
     # redis_key_prefix: Redis 中存储配额数据的 key 前缀
     #   默认值: "chat_quota_apikey:"
     #   最终 key 格式:
-    #   示例（带 route_name）: chat_quota_apikey_infer-e43c2026-052b-4544-82fd-38da299a2a4e:81d64d31b4db62c328aeef8da6b5a8f5c3ea516cb763976f5df2dde4db24a010
+    #   示例（带 rule_name）: chat_quota_apikey_infer-e43c2026-052b-4544-82fd-38da299a2a4e:81d64d31b4db62c328aeef8da6b5a8f5c3ea516cb763976f5df2dde4db24a010
     redis_key_prefix: "chat_quota_apikey"
 
     # ========================================
@@ -100,7 +100,7 @@ spec:
 
   matchRules: [] # 路由级别配置可以覆盖默认配置
   # - config:
-  #     route_name: infer-e43c2026-052b-4544-82fd-38da299a2a4e
+  #     rule_name: infer-e43c2026-052b-4544-82fd-38da299a2a4e
   #   ingress:
   #   - ai-route-example.internal
   defaultConfigDisable: false

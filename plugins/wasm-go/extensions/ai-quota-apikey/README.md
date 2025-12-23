@@ -14,12 +14,12 @@ description: 基于 API-Key 的 AI 配额管理插件配置参考
 
 插件使用两种Redis数据结构存储配额信息：
 
-1. **单个配额Key**：`{redis_key_prefix}_{route_name}:{api_key}` -> 剩余配额（整数）
+1. **单个配额Key**：`{redis_key_prefix}_{rule_name}:{api_key}` -> 剩余配额（整数）
    - 用于快速查询单个API-Key的剩余配额
    - 每次配额消费时直接更新此key
 
-2. **配额汇总Hash**：`{redis_key_prefix}_total_quota:{route_name}` -> `{api_key: "预设配额:剩余配额"}`
-   - 用于批量查询某个route_name下所有API-Key的配额信息
+2. **配额汇总Hash**：`{redis_key_prefix}_total_quota:{rule_name}` -> `{api_key: "预设配额:剩余配额"}`
+   - 用于批量查询某个rule_name下所有API-Key的配额信息
    - Hash的field为api_key（如果开启了hash_api_key则存储hash值）
    - Hash的value格式为：`预设配额:剩余配额`（例如：`10000:5000`）
    - 每次配额更新时会同步更新Hash中的值
@@ -109,14 +109,14 @@ curl https://example.com/ai-quota-manager/quota-manager/refresh \
   -d '{
     "api_key": "sk-user-xxx",
     "quota": 10000,
-    "route_name": "route1"
+    "rule_name": "route1"
   }'
 ```
 
 参数说明：
 - `api_key`：要刷新的API-Key（必填）
 - `quota`：新的配额值（必填，整数）
-- `route_name`：路由名称（选填，如果不提供则使用配置中的route_name）
+- `rule_name`：规则名称（选填，如果不提供则使用配置中的rule_name）
 
 **注意**：所有管理接口的 POST 请求仅支持 JSON 格式，请求体必须是有效的 JSON。
 
@@ -131,28 +131,28 @@ Redis 中：
 
 ### 查询配额列表
 
-查询指定route_name下所有API-Key的配额信息：
+查询指定rule_name下所有API-Key的配额信息：
 
 ```bash
-curl "https://example.com/ai-quota-manager/quota-manager/list?route_name=route1" \
+curl "https://example.com/ai-quota-manager/quota-manager/list?rule_name=route1" \
   -H "Authorization: Bearer sk-admin-xxx"
 ```
 
 参数说明：
-- `route_name`：路由名称（选填，如果不提供则使用配置中的route_name）
+- `rule_name`：规则名称（选填，如果不提供则使用配置中的rule_name）
 
 将返回：
 ```json
 [
   {
     "api_key": "hash_of_sk-user-xxx",
-    "route_name": "route1",
+    "rule_name": "route1",
     "preset_quota": 10000,
     "remaining_quota": 5000
   },
   {
     "api_key": "hash_of_sk-user-yyy",
-    "route_name": "route1",
+    "rule_name": "route1",
     "preset_quota": 20000,
     "remaining_quota": 15000
   }
@@ -172,14 +172,14 @@ curl https://example.com/ai-quota-manager/quota-manager/delta \
   -d '{
     "api_key": "sk-user-xxx",
     "value": 100,
-    "route_name": "route1"
+    "rule_name": "route1"
   }'
 ```
 
 参数说明：
 - `api_key`：要增减配额的API-Key（必填）
 - `value`：增减的配额值（必填，整数，正数表示增加，负数表示减少）
-- `route_name`：路由名称（选填，如果不提供则使用配置中的route_name）
+- `rule_name`：规则名称（选填，如果不提供则使用配置中的rule_name）
 
 操作说明：
 - 如果`value`为正数，剩余配额会增加对应值
@@ -199,13 +199,13 @@ curl https://example.com/ai-quota-manager/quota-manager/delete \
   -H "Content-Type: application/json" \
   -d '{
     "api_key": "sk-user-xxx",
-    "route_name": "route1"
+    "rule_name": "route1"
   }'
 ```
 
 参数说明：
 - `api_key`：要删除配额的API-Key（必填）
-- `route_name`：路由名称（选填，如果不提供则使用配置中的route_name）
+- `rule_name`：规则名称（选填，如果不提供则使用配置中的rule_name）
 
 操作说明：
 - 删除操作会同时删除单个配额Key和Hash中的对应field
@@ -227,8 +227,8 @@ curl https://example.com/ai-quota-manager/quota-manager/delete \
 | 配额标识 | Consumer 名称 | API-Key |
 | 依赖认证插件 | 需要（key-auth/jwt-auth 等） | 不需要 |
 | API-Key 提取 | 通过认证插件间接获取 | 直接从请求提取 |
-| Redis Key | `{prefix}{consumer}` | `{prefix}_{route_name}:{api_key}` 或 `{prefix}_{route_name}:{hash(api_key)}` |
-| 配额汇总存储 | 无 | `{prefix}_total_quota:{route_name}` (Hash) |
+| Redis Key | `{prefix}{consumer}` | `{prefix}_{rule_name}:{api_key}` 或 `{prefix}_{rule_name}:{hash(api_key)}` |
+| 配额汇总存储 | 无 | `{prefix}_total_quota:{rule_name}` (Hash) |
 | 管理接口参数 | `consumer=xxx` | `api_key=xxx` |
 | 管理认证 | `admin_consumer` | `admin_api_key` |
 | 配额列表查询 | 不支持 | 支持（`/list`接口） |
@@ -266,10 +266,10 @@ curl https://example.com/ai-quota-manager/quota-manager/delete \
 
 | 接口路径 | 方法 | 功能 | 请求格式 | 参数 |
 |---------|------|------|---------|------|
-| `/ai-quota-manager{admin_path}/list` | GET | 查询指定route_name下所有API-Key的配额列表 | Query参数 | `route_name`（选填） |
-| `/ai-quota-manager{admin_path}/refresh` | POST | 刷新配额（重置预设配额和剩余配额） | JSON | `api_key`（必填）、`quota`（必填）、`route_name`（选填） |
-| `/ai-quota-manager{admin_path}/delta` | POST | 增减配额（只修改剩余配额） | JSON | `api_key`（必填）、`value`（必填）、`route_name`（选填） |
-| `/ai-quota-manager{admin_path}/delete` | POST | 删除配额（删除单个配额Key和Hash中的field） | JSON | `api_key`（必填）、`route_name`（选填） |
+| `/ai-quota-manager{admin_path}/list` | GET | 查询指定rule_name下所有API-Key的配额列表 | Query参数 | `rule_name`（选填） |
+| `/ai-quota-manager{admin_path}/refresh` | POST | 刷新配额（重置预设配额和剩余配额） | JSON | `api_key`（必填）、`quota`（必填）、`rule_name`（选填） |
+| `/ai-quota-manager{admin_path}/delta` | POST | 增减配额（只修改剩余配额） | JSON | `api_key`（必填）、`value`（必填）、`rule_name`（选填） |
+| `/ai-quota-manager{admin_path}/delete` | POST | 删除配额（删除单个配额Key和Hash中的field） | JSON | `api_key`（必填）、`rule_name`（选填） |
 
 **重要说明**：
 - 所有管理接口都需要使用`admin_api_key`进行认证（通过Authorization header或query参数）
