@@ -11,7 +11,7 @@ metadata:
     higress.io/wasm-plugin-built-in: "false"
     higress.io/wasm-plugin-category: custom
     higress.io/wasm-plugin-name: ai-quota-apikey
-    higress.io/wasm-plugin-version: 0.0.7
+    higress.io/wasm-plugin-version: 0.0.8
 spec:
   defaultConfig:
     # ========================================
@@ -53,11 +53,12 @@ spec:
     # 可选配置项：管理路径
     # ========================================
     # admin_path: 配额管理接口的路径前缀
-    #   默认值: "/quota"
-    #   管理接口路径:
-    #     - 查询配额: /v1/chat/completions{admin_path}?api_key=xxx
-    #     - 刷新配额: /v1/chat/completions{admin_path}/refresh
-    #     - 增减配额: /v1/chat/completions{admin_path}/delta
+    #   默认值: "/quota-manager"
+    #   管理接口路径格式: /ai-quota-manager{admin_path}/{action}
+    #   管理接口路径示例（admin_path="/quota-manager"）:
+    #     - 刷新配额: /ai-quota-manager/quota-manager/refresh
+    #     - 查询列表: /ai-quota-manager/quota-manager/list
+    #     - 删除配额: /ai-quota-manager/quota-manager/delete
     admin_path: "/quota-manager"
 
     # ========================================
@@ -110,5 +111,5 @@ spec:
   # For local testing, use file:// URL
   # url: file:///opt/plugins/wasm-go/extensions/ai-quota-apikey/plugin.wasm
   # For production, use OCI registry
-  url: oci://quanzhenglong.com/camp/ai-quota-apikey:v0.0.7
+  url: oci://quanzhenglong.com/camp/ai-quota-apikey:v0.0.8
 
