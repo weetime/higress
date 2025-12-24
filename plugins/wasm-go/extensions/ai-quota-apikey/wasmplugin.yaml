@@ -11,7 +11,7 @@ metadata:
     higress.io/wasm-plugin-built-in: "false"
     higress.io/wasm-plugin-category: custom
     higress.io/wasm-plugin-name: ai-quota-apikey
-    higress.io/wasm-plugin-version: 0.0.8
+    higress.io/wasm-plugin-version: 0.0.17
 spec:
   defaultConfig:
     # ========================================
@@ -111,5 +111,5 @@ spec:
   # For local testing, use file:// URL
   # url: file:///opt/plugins/wasm-go/extensions/ai-quota-apikey/plugin.wasm
   # For production, use OCI registry
-  url: oci://quanzhenglong.com/camp/ai-quota-apikey:v0.0.8
+  url: oci://quanzhenglong.com/camp/ai-quota-apikey:v0.0.17
 

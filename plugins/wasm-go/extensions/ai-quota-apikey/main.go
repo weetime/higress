@@ -42,6 +42,8 @@ const (
 	ctxKeyHasQuotaConfig = "hasQuotaConfig"
 	ctxKeyPresetQuota    = "presetQuota"    // 预设配额，在请求头阶段获取
 	ctxKeyRemainingQuota = "remainingQuota" // 当前剩余配额，在请求头阶段获取
+	ctxKeyQuotaName      = "quotaName"      // 配额名称，在请求头阶段获取
+	ctxKeyQuotaUsername  = "quotaUsername"  // 配额用户名，在请求头阶段获取
 )
 
 // ============================================================================
@@ -318,28 +320,57 @@ func getTotalQuotaKey(config QuotaConfig, ruleName string) string {
 // 配额值格式化
 // ============================================================================
 
-// formatQuotaValue 格式化配额值为字符串
-// 格式: "preset:remaining"
-func formatQuotaValue(preset, remaining int) string {
-	return fmt.Sprintf("%d:%d", preset, remaining)
+// QuotaValue 配额值结构体
+type QuotaValue struct {
+	PresetQuota    int    `json:"preset_quota"`
+	RemainingQuota int    `json:"remaining_quota"`
+	Name           string `json:"name,omitempty"`
+	Username       string `json:"username,omitempty"`
+}
+
+// formatQuotaValue 格式化配额值为 JSON 字符串
+// 格式: JSON 包含 preset_quota, remaining_quota, name, username
+func formatQuotaValue(preset, remaining int, name, username string) string {
+	quotaValue := QuotaValue{
+		PresetQuota:    preset,
+		RemainingQuota: remaining,
+		Name:           name,
+		Username:       username,
+	}
+	jsonBytes, err := json.Marshal(quotaValue)
+	if err != nil {
+		// 如果 JSON 序列化失败，回退到旧格式以保持兼容性
+		return fmt.Sprintf("%d:%d", preset, remaining)
+	}
+	return string(jsonBytes)
 }
 
 // parseQuotaValue 解析配额值字符串
-// 格式: "preset:remaining"
-func parseQuotaValue(value string) (preset int, remaining int, err error) {
+// 支持两种格式：
+// 1. JSON 格式: {"preset_quota":100,"remaining_quota":50,"name":"xxx","username":"yyy"}
+// 2. 旧格式: "preset:remaining" (向后兼容)
+func parseQuotaValue(value string) (preset int, remaining int, name string, username string, err error) {
+	// 尝试解析为 JSON 格式
+	var quotaValue QuotaValue
+	if err := json.Unmarshal([]byte(value), &quotaValue); err == nil {
+		return quotaValue.PresetQuota, quotaValue.RemainingQuota, quotaValue.Name, quotaValue.Username, nil
+	}
+
+	// 如果 JSON 解析失败，尝试解析旧格式 "preset:remaining" (向后兼容)
 	parts := strings.Split(value, ":")
-	if len(parts) != 2 {
-		return 0, 0, fmt.Errorf("invalid quota value format: %s", value)
+	if len(parts) == 2 {
+		preset, err1 := strconv.Atoi(parts[0])
+		if err1 != nil {
+			return 0, 0, "", "", fmt.Errorf("invalid preset quota: %s", parts[0])
+		}
+		remaining, err2 := strconv.Atoi(parts[1])
+		if err2 != nil {
+			return 0, 0, "", "", fmt.Errorf("invalid remaining quota: %s", parts[1])
+		}
+		return preset, remaining, "", "", nil
 	}
-	preset, err = strconv.Atoi(parts[0])
-	if err != nil {
-		return 0, 0, fmt.Errorf("invalid preset quota: %s", parts[0])
-	}
-	remaining, err = strconv.Atoi(parts[1])
-	if err != nil {
-		return 0, 0, fmt.Errorf("invalid remaining quota: %s", parts[1])
-	}
-	return preset, remaining, nil
+
+	return 0, 0, "", "", fmt.Errorf("invalid quota value format: %s", value)
 }
 
 // ============================================================================
@@ -500,11 +531,17 @@ func checkQuotaAndFetchPreset(ctx wrapper.HttpContext, config QuotaConfig, apiKe
 
 			if !hashResponse.IsNull() {
 				quotaValueStr := hashResponse.String()
-				presetQuota, _, err := parseQuotaValue(quotaValueStr)
+				presetQuota, _, name, username, err := parseQuotaValue(quotaValueStr)
 				if err == nil {
-					// 保存预设配额到上下文，供响应阶段使用
+					// 保存预设配额、name 和 username 到上下文，供响应阶段使用
 					ctx.SetContext(ctxKeyPresetQuota, presetQuota)
-					log.Debugf("apiKey:%s presetQuota:%d remainingQuota:%d saved to context", apiKey, presetQuota, remainingQuota)
+					if name != "" {
+						ctx.SetContext(ctxKeyQuotaName, name)
+					}
+					if username != "" {
+						ctx.SetContext(ctxKeyQuotaUsername, username)
+					}
+					log.Debugf("apiKey:%s presetQuota:%d remainingQuota:%d name:%s username:%s saved to context", apiKey, presetQuota, remainingQuota, name, username)
 				}
 			}
 			proxywasm.ResumeHttpRequest()
@@ -625,10 +662,24 @@ func updateQuotaOnConsumption(ctx wrapper.HttpContext, config QuotaConfig, apiKe
 		newRemainingQuota = 0
 	}
 
-	// 更新 Hash（fire-and-forget）
-	newQuotaValue := formatQuotaValue(presetQuota, newRemainingQuota)
-	log.Debugf("Updating hash: key=%s, field=%s, value=%s (preset=%d, remaining=%d->%d, consumed=%d)",
-		totalQuotaKey, apiKeyForHash, newQuotaValue, presetQuota, currentRemainingQuota, newRemainingQuota, totalToken)
+	// 从上下文获取 name 和 username（如果存在）
+	name := ""
+	username := ""
+	if nameVal := ctx.GetContext(ctxKeyQuotaName); nameVal != nil {
+		if nameStr, ok := nameVal.(string); ok {
+			name = nameStr
+		}
+	}
+	if usernameVal := ctx.GetContext(ctxKeyQuotaUsername); usernameVal != nil {
+		if usernameStr, ok := usernameVal.(string); ok {
+			username = usernameStr
+		}
+	}
+
+	// 更新 Hash（fire-and-forget），保持 name 和 username 字段
+	newQuotaValue := formatQuotaValue(presetQuota, newRemainingQuota, name, username)
+	log.Debugf("Updating hash: key=%s, field=%s, value=%s (preset=%d, remaining=%d->%d, consumed=%d, name=%s, username=%s)",
+		totalQuotaKey, apiKeyForHash, newQuotaValue, presetQuota, currentRemainingQuota, newRemainingQuota, totalToken, name, username)
 	config.redisClient.HSet(totalQuotaKey, apiKeyForHash, newQuotaValue, nil)
 }
 
@@ -663,11 +714,15 @@ func refreshQuota(ctx wrapper.HttpContext, config QuotaConfig, adminApiKey strin
 		ruleName = config.RuleName
 	}
 
+	// 获取 name 和 username（可选字段）
+	name := values["name"]
+	username := values["username"]
+
 	// 生成 Redis Keys
 	redisKey := getRedisKey(config, queryApiKey, ruleName)
 	totalQuotaKey := getTotalQuotaKey(config, ruleName)
 	apiKeyForHash := getApiKeyForHash(config, queryApiKey)
-	quotaValue := formatQuotaValue(quota, quota)
+	quotaValue := formatQuotaValue(quota, quota, name, username)
 
 	// 更新 Redis
 	err2 := config.redisClient.Set(redisKey, quota, func(response resp.Value) {
@@ -831,7 +886,7 @@ func buildQuotaList(response resp.Value, ruleName string) []map[string]interface
 		apiKeyField := arr[i].String()
 		quotaValueStr := arr[i+1].String()
 
-		presetQuota, remainingQuota, err := parseQuotaValue(quotaValueStr)
+		presetQuota, remainingQuota, name, username, err := parseQuotaValue(quotaValueStr)
 		if err != nil {
 			log.Warnf("Failed to parse quota value for apiKey:%s, value:%s, error:%v", apiKeyField, quotaValueStr, err)
 			continue
@@ -841,6 +896,12 @@ func buildQuotaList(response resp.Value, ruleName string) []map[string]interface
 			"api_key":         apiKeyField,
 			"preset_quota":    presetQuota,
 			"remaining_quota": remainingQuota,
+		}
+		if name != "" {
+			quotaInfo["name"] = name
+		}
+		if username != "" {
+			quotaInfo["username"] = username
 		}
 		if ruleName != "" {
 			quotaInfo["rule_name"] = ruleName
