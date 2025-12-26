@@ -267,8 +267,8 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config RouteAuthConfig, log l
 	}
 
 	// 用户不在任何允许的租户中
-	log.Warnf("user %q not authorized (allowed workspaces: %v)", userName, config.allowWorkspaces)
-	return deniedAccessDenied(userName, config.allowWorkspaces)
+	log.Warnf("user %q not authorized to access this route", userName)
+	return deniedAccessDenied(userName)
 }
 
 // ============================================================================
@@ -337,25 +337,25 @@ func deniedInvalidAuthFormat(headerName string) types.Action {
 	return types.ActionContinue
 }
 
-// deniedInvalidAPIKey 当 API key 未找到时返回 401
+// deniedInvalidAPIKey 当 API key 不允许访问此路由时返回 403
 func deniedInvalidAPIKey() types.Action {
 	_ = proxywasm.SendHttpResponseWithDetail(
-		http.StatusUnauthorized,
-		pluginName+".invalid_api_key",
+		http.StatusForbidden,
+		pluginName+".access_denied",
 		wwwAuthenticateHeader(protectionSpace),
-		[]byte(`{"error":"Invalid API key"}`),
+		[]byte(`{"error":"API key is not allowed to access this route"}`),
 		-1,
 	)
 	return types.ActionContinue
 }
 
 // deniedAccessDenied 当用户无权访问路由时返回 403
-func deniedAccessDenied(userName string, allowWorkspaces []string) types.Action {
+func deniedAccessDenied(userName string) types.Action {
 	_ = proxywasm.SendHttpResponseWithDetail(
 		http.StatusForbidden,
 		pluginName+".access_denied",
 		responseHeaders(),
-		[]byte(fmt.Sprintf(`{"error":"User %s is not authorized to access this route (allowed workspaces: %v)"}`, userName, allowWorkspaces)),
+		[]byte(fmt.Sprintf(`{"error":"User %s is not authorized to access this route"}`, userName)),
 		-1,
 	)
 	return types.ActionContinue
