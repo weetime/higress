@@ -108,53 +108,51 @@ func parseConfig(json gjson.Result, config *RouteAuthConfig, log log.Log) error 
 
 	log.Infof("config: auth_header=%s", config.authHeaderName)
 
-	// Parse workspace_users (required)
+	// Parse workspace_users (optional)
+	// 如果不配置，则不进行鉴权
 	workspaceUsersJson := json.Get("workspace_users")
-	if !workspaceUsersJson.Exists() {
-		return errors.New("workspace_users is required")
-	}
-
-	workspaceUsersJson.ForEach(func(key, value gjson.Result) bool {
-		workspace := key.String()
-		users := make([]string, 0)
-		if value.IsArray() {
-			for _, user := range value.Array() {
-				users = append(users, user.String())
+	if workspaceUsersJson.Exists() {
+		workspaceUsersJson.ForEach(func(key, value gjson.Result) bool {
+			workspace := key.String()
+			users := make([]string, 0)
+			if value.IsArray() {
+				for _, user := range value.Array() {
+					users = append(users, user.String())
+				}
 			}
-		}
-		config.workspaceUsers[workspace] = users
-		log.Debugf("loaded workspace %q with %d users: %v", workspace, len(users), users)
-		return true
-	})
-
-	if len(config.workspaceUsers) == 0 {
-		return errors.New("workspace_users cannot be empty")
+			config.workspaceUsers[workspace] = users
+			log.Debugf("loaded workspace %q with %d users: %v", workspace, len(users), users)
+			return true
+		})
+	} else {
+		log.Infof("workspace_users not configured, authentication will be disabled")
 	}
 
-	// Parse user_apikeys (required)
+	// Parse user_apikeys (optional)
+	// 如果不配置，则不进行鉴权
 	// Configuration format: username -> []apiKey
 	// Internal storage: apiKey -> username (for fast lookup)
 	userApiKeysJson := json.Get("user_apikeys")
-	if !userApiKeysJson.Exists() {
-		return errors.New("user_apikeys is required")
-	}
-
-	userApiKeysJson.ForEach(func(key, value gjson.Result) bool {
-		userName := key.String()
-		if value.IsArray() {
-			for _, apiKey := range value.Array() {
-				apiKeyStr := apiKey.String()
-				config.apiKeyMapping[apiKeyStr] = userName
+	if userApiKeysJson.Exists() {
+		userApiKeysJson.ForEach(func(key, value gjson.Result) bool {
+			userName := key.String()
+			if value.IsArray() {
+				for _, apiKey := range value.Array() {
+					apiKeyStr := apiKey.String()
+					config.apiKeyMapping[apiKeyStr] = userName
+				}
 			}
-		}
-		return true
-	})
-
-	if len(config.apiKeyMapping) == 0 {
-		return errors.New("user_apikeys cannot be empty")
+			return true
+		})
+	} else {
+		log.Infof("user_apikeys not configured, authentication will be disabled")
 	}
 
-	log.Infof("loaded %d API keys for %d workspaces", len(config.apiKeyMapping), len(config.workspaceUsers))
+	if len(config.apiKeyMapping) > 0 || len(config.workspaceUsers) > 0 {
+		log.Infof("loaded %d API keys for %d workspaces", len(config.apiKeyMapping), len(config.workspaceUsers))
+	} else {
+		log.Infof("no authentication configured, all requests will be allowed")
+	}
 
 	return nil
 }
@@ -207,6 +205,12 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config RouteAuthConfig, log l
 	// 这种情况下跳过处理（因为只有 matchRules 中才有 allow_workspaces）
 	if len(config.allowWorkspaces) == 0 {
 		log.Debugf("no allow_workspaces configured, skipping")
+		return types.ActionContinue
+	}
+
+	// Step 1.5: 如果 workspace_users 或 user_apikeys 未配置，则不进行鉴权
+	if len(config.workspaceUsers) == 0 || len(config.apiKeyMapping) == 0 {
+		log.Debugf("no authentication configured (workspace_users and user_apikeys are both empty), skipping authentication")
 		return types.ActionContinue
 	}
 

@@ -11,7 +11,7 @@ metadata:
     higress.io/wasm-plugin-built-in: "false"
     higress.io/wasm-plugin-category: custom
     higress.io/wasm-plugin-name: ai-route-auth
-    higress.io/wasm-plugin-version: 0.0.1
+    higress.io/wasm-plugin-version: 0.0.2
 spec:
   defaultConfig:
     # ========================================
@@ -98,5 +98,5 @@ spec:
   # For local testing, use file:// URL
   # url: file:///opt/plugins/wasm-go/extensions/ai-route-auth/plugin.wasm
   # For production, use OCI registry
-  url: oci://quanzhenglong.com/camp/ai-route-auth:v0.0.1
+  url: oci://quanzhenglong.com/camp/ai-route-auth:v0.0.2
 
