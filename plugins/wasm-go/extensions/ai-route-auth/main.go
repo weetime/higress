@@ -62,10 +62,20 @@ func init() {
 // Configuration Types
 // ============================================================================
 
+// WorkspaceProject 表示一个租户及其下的项目列表
+// 序列化格式: "workspaceName:project1,project2" 或 "*:*"
+type WorkspaceProject struct {
+	WorkspaceName string
+	ProjectNames  []string
+}
+
 // RouteAuthConfig 路由认证配置
 type RouteAuthConfig struct {
 	// 租户到用户的映射 (workspace -> []users)
 	workspaceUsers map[string][]string
+
+	// 项目到用户的映射 (project -> []users)
+	projectUsers map[string][]string
 
 	// API Key 到用户的映射 (apiKey -> username)
 	// 从 user_apikeys 转换而来，用于快速查找
@@ -74,8 +84,9 @@ type RouteAuthConfig struct {
 	// 认证头名称，默认 "Authorization"
 	authHeaderName string
 
-	// 允许访问的租户列表（从 matchRules 中获取）
-	allowWorkspaces []string
+	// 允许访问的租户-项目列表（从 matchRules 中获取）
+	// 替代原 allowWorkspaces
+	allowWorkspaceProjects []WorkspaceProject
 }
 
 // ============================================================================
@@ -90,6 +101,9 @@ type RouteAuthConfig struct {
 //	  "workspace_users": {
 //	    "ai-for-deployer": ["admin", "xiaoma"]
 //	  },
+//	  "project_users": {
+//	    "project-a": ["admin", "user1"]
+//	  },
 //	  "user_apikeys": {
 //	    "admin": ["sk-aaa", "ak-bbb"],
 //	    "username2": ["sk-ccc"]
@@ -98,6 +112,7 @@ type RouteAuthConfig struct {
 //	}
 func parseConfig(json gjson.Result, config *RouteAuthConfig, log log.Log) error {
 	config.workspaceUsers = make(map[string][]string)
+	config.projectUsers = make(map[string][]string)
 	config.apiKeyMapping = make(map[string]string)
 
 	// Parse auth_header_name (optional)
@@ -125,7 +140,27 @@ func parseConfig(json gjson.Result, config *RouteAuthConfig, log log.Log) error 
 			return true
 		})
 	} else {
-		log.Infof("workspace_users not configured, authentication will be disabled")
+		log.Infof("workspace_users not configured")
+	}
+
+	// Parse project_users (optional)
+	// 项目级别的用户列表，用于精确到项目的鉴权
+	projectUsersJson := json.Get("project_users")
+	if projectUsersJson.Exists() {
+		projectUsersJson.ForEach(func(key, value gjson.Result) bool {
+			project := key.String()
+			users := make([]string, 0)
+			if value.IsArray() {
+				for _, user := range value.Array() {
+					users = append(users, user.String())
+				}
+			}
+			config.projectUsers[project] = users
+			log.Debugf("loaded project %q with %d users: %v", project, len(users), users)
+			return true
+		})
+	} else {
+		log.Infof("project_users not configured")
 	}
 
 	// Parse user_apikeys (optional)
@@ -148,8 +183,9 @@ func parseConfig(json gjson.Result, config *RouteAuthConfig, log log.Log) error 
 		log.Infof("user_apikeys not configured, authentication will be disabled")
 	}
 
-	if len(config.apiKeyMapping) > 0 || len(config.workspaceUsers) > 0 {
-		log.Infof("loaded %d API keys for %d workspaces", len(config.apiKeyMapping), len(config.workspaceUsers))
+	if len(config.apiKeyMapping) > 0 || len(config.workspaceUsers) > 0 || len(config.projectUsers) > 0 {
+		log.Infof("loaded %d API keys, %d workspaces, %d projects",
+			len(config.apiKeyMapping), len(config.workspaceUsers), len(config.projectUsers))
 	} else {
 		log.Infof("no authentication configured, all requests will be allowed")
 	}
@@ -163,35 +199,49 @@ func parseConfig(json gjson.Result, config *RouteAuthConfig, log log.Log) error 
 //
 //	{
 //	  "rule_name": "infer-357cefd0-c54d-4d8b-9637-2beb7006c0e4",
-//	  "allow_workspaces": ["*"]  // 或 ["tenant1", "tenant2"]
+//	  "allow_workspace_projects": ["*:*", "tenant1:*", "tenant1:project-a,project-b"]
 //	}
 func parseRuleConfig(json gjson.Result, global RouteAuthConfig, config *RouteAuthConfig, log log.Log) error {
 	// 继承全局配置
 	*config = global
 
-	// Parse allow_workspaces (required in matchRules)
-	allowWorkspacesJson := json.Get("allow_workspaces")
-	if !allowWorkspacesJson.Exists() {
-		return errors.New("allow_workspaces is required in matchRules config")
+	// Parse allow_workspace_projects (required in matchRules)
+	allowWPJson := json.Get("allow_workspace_projects")
+	if !allowWPJson.Exists() {
+		return errors.New("allow_workspace_projects is required in matchRules config")
 	}
 
-	config.allowWorkspaces = make([]string, 0)
-	if allowWorkspacesJson.IsArray() {
-		for _, workspace := range allowWorkspacesJson.Array() {
-			workspaceStr := workspace.String()
-			config.allowWorkspaces = append(config.allowWorkspaces, workspaceStr)
+	config.allowWorkspaceProjects = make([]WorkspaceProject, 0)
+	if allowWPJson.IsArray() {
+		for _, item := range allowWPJson.Array() {
+			wp := parseWorkspaceProjectString(item.String())
+			if wp != nil {
+				config.allowWorkspaceProjects = append(config.allowWorkspaceProjects, *wp)
+			}
 		}
 	}
 
-	if len(config.allowWorkspaces) == 0 {
-		return errors.New("allow_workspaces cannot be empty")
+	if len(config.allowWorkspaceProjects) == 0 {
+		return errors.New("allow_workspace_projects cannot be empty")
 	}
 
-	log.Debugf("loaded allow_workspaces: %v", config.allowWorkspaces)
+	log.Debugf("loaded allow_workspace_projects: %v", config.allowWorkspaceProjects)
 
 	// rule_name 字段仅作为配置标识，插件逻辑中不需要使用
 
 	return nil
+}
+
+// parseWorkspaceProjectString 解析 "workspace:project1,project2" 格式的字符串
+func parseWorkspaceProjectString(s string) *WorkspaceProject {
+	parts := strings.SplitN(s, ":", 2)
+	if len(parts) != 2 {
+		return nil
+	}
+	return &WorkspaceProject{
+		WorkspaceName: parts[0],
+		ProjectNames:  strings.Split(parts[1], ","),
+	}
 }
 
 // ============================================================================
@@ -200,17 +250,17 @@ func parseRuleConfig(json gjson.Result, global RouteAuthConfig, config *RouteAut
 
 // onHttpRequestHeaders 处理 HTTP 请求头，进行路由权限验证
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config RouteAuthConfig, log log.Log) types.Action {
-	// Step 1: 检查是否有 allow_workspaces 配置
-	// 如果没有匹配的 matchRules，config 会是 defaultConfig，其中没有 allow_workspaces
-	// 这种情况下跳过处理（因为只有 matchRules 中才有 allow_workspaces）
-	if len(config.allowWorkspaces) == 0 {
-		log.Debugf("no allow_workspaces configured, skipping")
+	// Step 1: 检查是否有 allow_workspace_projects 配置
+	// 如果没有匹配的 matchRules，config 会是 defaultConfig，其中没有 allow_workspace_projects
+	// 这种情况下跳过处理（因为只有 matchRules 中才有 allow_workspace_projects）
+	if len(config.allowWorkspaceProjects) == 0 {
+		log.Debugf("no allow_workspace_projects configured, skipping")
 		return types.ActionContinue
 	}
 
-	// Step 1.5: 如果 workspace_users 或 user_apikeys 未配置，则不进行鉴权
-	if len(config.workspaceUsers) == 0 || len(config.apiKeyMapping) == 0 {
-		log.Debugf("no authentication configured (workspace_users and user_apikeys are both empty), skipping authentication")
+	// Step 1.5: 如果 user_apikeys 未配置，则不进行鉴权
+	if len(config.apiKeyMapping) == 0 {
+		log.Debugf("no authentication configured (apiKeyMapping is empty), skipping authentication")
 		return types.ActionContinue
 	}
 
@@ -242,31 +292,35 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config RouteAuthConfig, log l
 	_ = proxywasm.ReplaceHttpRequestHeader("x-api-key-name", userName+"/"+apiKeySuffix)
 	log.Debugf("set consumer header: user=%s", userName)
 
-	// Step 5: 权限验证
-	// 情况A：通配符模式 (allow_workspaces 包含 "*")
-	for _, workspace := range config.allowWorkspaces {
-		if workspace == "*" {
-			log.Infof("auth success: user=%s (wildcard)", userName)
+	// Step 5: 权限验证（三级鉴权）
+	for _, wp := range config.allowWorkspaceProjects {
+		// 情况A: WorkspaceName 为 "*"，公开访问，所有 API Key 用户都能访问
+		if wp.WorkspaceName == "*" {
+			log.Infof("auth success: user=%s (public wildcard)", userName)
 			return types.ActionContinue
 		}
-	}
 
-	// 情况B：租户列表模式 (allow_workspaces 是具体的租户数组)
-	for _, workspace := range config.allowWorkspaces {
-		users, exists := config.workspaceUsers[workspace]
-		if !exists {
-			log.Debugf("workspace %q not found in workspace_users", workspace)
+		// 情况B: ProjectNames 包含 "*"，该 Workspace 下所有用户都可以访问
+		if containsWildcard(wp.ProjectNames) {
+			users, exists := config.workspaceUsers[wp.WorkspaceName]
+			if exists && contains(users, userName) {
+				log.Infof("auth success: user=%s, workspace=%s (all projects)", userName, wp.WorkspaceName)
+				return types.ActionContinue
+			}
 			continue
 		}
 
-		if contains(users, userName) {
-			// 用户在该租户的用户列表中，授权成功
-			log.Infof("auth success: user=%s, workspace=%s", userName, workspace)
-			return types.ActionContinue
+		// 情况C: 指定了具体的 ProjectNames，只有这些 Project 中的用户才能访问
+		for _, projectName := range wp.ProjectNames {
+			users, exists := config.projectUsers[projectName]
+			if exists && contains(users, userName) {
+				log.Infof("auth success: user=%s, workspace=%s, project=%s", userName, wp.WorkspaceName, projectName)
+				return types.ActionContinue
+			}
 		}
 	}
 
-	// 用户不在任何允许的租户中
+	// 用户不在任何允许的租户/项目中
 	log.Warnf("user %q not authorized to access this route", userName)
 	return deniedAccessDenied(userName)
 }
@@ -303,6 +357,16 @@ func extractAPIKey(headerValue, headerName string) (string, error) {
 func contains(slice []string, item string) bool {
 	for _, s := range slice {
 		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+// containsWildcard 检查切片中是否包含通配符 "*"
+func containsWildcard(slice []string) bool {
+	for _, s := range slice {
+		if s == "*" {
 			return true
 		}
 	}

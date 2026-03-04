@@ -4,14 +4,14 @@ metadata:
   name: ai-route-auth.rise.io
   namespace: higress-system
   annotations:
-    higress.io/wasm-plugin-description: 基于 API Key 和租户的路由访问控制，通过 matchRules 配置不同路由的访问权限。
+    higress.io/wasm-plugin-description: 基于 API Key、租户和项目的路由访问控制，通过 matchRules 配置不同路由的访问权限。
     higress.io/wasm-plugin-title: ai-route-auth
   labels:
     higress.io/resource-definer: higress
     higress.io/wasm-plugin-built-in: "false"
     higress.io/wasm-plugin-category: custom
     higress.io/wasm-plugin-name: ai-route-auth
-    higress.io/wasm-plugin-version: 0.0.3
+    higress.io/wasm-plugin-version: 0.0.5
 spec:
   defaultConfig:
     # ========================================
@@ -19,6 +19,8 @@ spec:
     # ========================================
     # workspace_users: 租户到用户的映射关系
     # 格式: 租户名称 -> 该租户下的用户列表
+    # 当 allow_workspace_projects 中 ProjectNames 为 "*" 时，
+    # 使用此映射检查用户是否属于该租户
     workspace_users:
       ai-for-deployer:
         - admin
@@ -26,9 +28,24 @@ spec:
       tenant1:
         - admin
         - user1
+        - user2
       tenant2:
         - user2
         - user3
+
+    # ========================================
+    # 必填配置项：项目用户映射配置
+    # ========================================
+    # project_users: 项目到用户的映射关系
+    # 格式: 项目名称 -> 该项目下的用户列表
+    # 当 allow_workspace_projects 中指定了具体的 ProjectNames 时，
+    # 使用此映射检查用户是否属于该项目
+    project_users:
+      project-a:
+        - admin
+        - user1
+      project-b:
+        - user2
 
     # ========================================
     # 必填配置项：API Key 映射配置
@@ -57,7 +74,7 @@ spec:
     #   - 默认值: "Authorization"
     #   - 如果使用 "Authorization"，需要 Bearer Token 格式: Authorization: Bearer sk-test
     #   - 如果使用自定义头（如 "X-Route-API-Key"），直接使用值: X-Route-API-Key: sk-test
-    
+
     # 取消下面一行注释可以使用自定义请求头名称：
     # auth_header_name: "Authorization"
 
@@ -68,27 +85,37 @@ spec:
     # 每个 matchRule 包含：
     #   - config: 路由级别的配置
     #     - rule_name: 规则名称（仅作为配置标识，插件逻辑中不使用）
-    #     - allow_workspaces: 允许访问的租户列表
-    #       - 如果包含 "*"，则所有用户都可以访问
-    #       - 如果是具体租户数组，则只有这些租户中的用户可以访问
+    #     - allow_workspace_projects: 允许访问的租户-项目列表
+    #       格式: "WorkspaceName:ProjectName1,ProjectName2"
+    #       - "*:*" 表示所有人都可以访问（公开模式）
+    #       - "tenant1:*" 表示 tenant1 下所有用户都可以访问
+    #       - "tenant1:project-a,project-b" 表示只有指定项目的用户才能访问
     #   - ingress: 匹配的 ingress 路由名称列表
 
-    # 示例1：通配符模式（所有租户都可以访问）
+    # 示例1：公开模式（所有 API Key 用户都可以访问）
     - config:
         rule_name: "infer-357cefd0-c54d-4d8b-9637-2beb7006c0e4"
-        allow_workspaces:
-          - "*"  # 所有租户都可以访问
+        allow_workspace_projects:
+          - "*:*"
       ingress:
         - ai-route-infer-8d9e797b-a180-4858-997e-c74857eb46df.internal
 
-    # 示例2：租户列表模式（只有指定租户的用户可以访问）
+    # 示例2：Workspace 全员模式（该租户下的所有用户都可以访问）
     # - config:
-    #     rule_name: "infer-357cefd0-c54d-4d8b-9637-2beb7006c0e4"
-    #     allow_workspaces:
-    #       - tenant1
-    #       - tenant2
+    #     rule_name: "infer-xxx"
+    #     allow_workspace_projects:
+    #       - "tenant1:*"
     #   ingress:
-    #     - ai-route-infer-8d9e797b-a180-4858-997e-c74857eb46df.internal
+    #     - ai-route-infer-xxx.internal
+
+    # 示例3：精确项目模式（只有指定项目中的用户才能访问）
+    # - config:
+    #     rule_name: "infer-yyy"
+    #     allow_workspace_projects:
+    #       - "tenant1:project-a,project-b"
+    #       - "tenant2:project-c"
+    #   ingress:
+    #     - ai-route-infer-yyy.internal
 
   defaultConfigDisable: true
   failStrategy: FAIL_CLOSE
@@ -98,5 +125,4 @@ spec:
   # For local testing, use file:// URL
   # url: file:///opt/plugins/wasm-go/extensions/ai-route-auth/plugin.wasm
   # For production, use OCI registry
-  url: oci://quanzhenglong.com/camp/ai-route-auth:v0.0.3
-
+  url: oci://quanzhenglong.com/camp/ai-route-auth:v0.0.5
