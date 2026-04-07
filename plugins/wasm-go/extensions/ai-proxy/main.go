@@ -52,6 +52,9 @@ var (
 		{provider.PathOpenAICompletions, provider.ApiNameCompletion},
 		{provider.PathOpenAIEmbeddings, provider.ApiNameEmbeddings},
 		{provider.PathOpenAIAudioSpeech, provider.ApiNameAudioSpeech},
+		{provider.PathOpenAIAudioTranscriptions, provider.ApiNameAudioTranscription},
+		{provider.PathOpenAIAudioTranslations, provider.ApiNameAudioTranslation},
+		{provider.PathOpenAIRealtime, provider.ApiNameRealtime},
 		{provider.PathOpenAIImageGeneration, provider.ApiNameImageGeneration},
 		{provider.PathOpenAIImageVariation, provider.ApiNameImageVariation},
 		{provider.PathOpenAIImageEdit, provider.ApiNameImageEdit},
@@ -102,6 +105,7 @@ func init() {
 		wrapper.ProcessStreamingResponseBody(onStreamingResponseBody),
 		wrapper.ProcessResponseBody(onHttpResponseBody),
 		wrapper.WithRebuildAfterRequests[config.PluginConfig](1000),
+		wrapper.WithRebuildMaxMemBytes[config.PluginConfig](200*1024*1024),
 	)
 }
 
@@ -145,7 +149,7 @@ func initContext(ctx wrapper.HttpContext) {
 		ctx.SetContext(ctxKey, value)
 	}
 	for _, originHeader := range headerToOriginalHeaderMapping {
-		proxywasm.RemoveHttpRequestHeader(originHeader)
+		_ = proxywasm.RemoveHttpRequestHeader(originHeader)
 	}
 	originalAuth, _ := proxywasm.GetHttpRequestHeader(util.HeaderOriginalAuth)
 	if originalAuth == "" {
@@ -204,28 +208,29 @@ func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConf
 		if handler, ok := activeProvider.(provider.ApiNameHandler); ok {
 			apiName = handler.GetApiName(path.Path)
 		}
+	} else {
+		// Only perform protocol conversion for non-original protocols.
+		// Auto-detect protocol based on request path and handle conversion if needed
+		// If request is Claude format (/v1/messages) but provider doesn't support it natively,
+		// convert to OpenAI format (/v1/chat/completions)
+		if apiName == provider.ApiNameAnthropicMessages && !providerConfig.IsSupportedAPI(provider.ApiNameAnthropicMessages) {
+			// Provider doesn't support Claude protocol natively, convert to OpenAI format
+			newPath := strings.Replace(path.Path, provider.PathAnthropicMessages, provider.PathOpenAIChatCompletions, 1)
+			_ = proxywasm.ReplaceHttpRequestHeader(":path", newPath)
+			// Update apiName to match the new path
+			apiName = provider.ApiNameChatCompletion
+			// Mark that we need to convert response back to Claude format
+			ctx.SetContext("needClaudeResponseConversion", true)
+			log.Debugf("[Auto Protocol] Claude request detected, provider doesn't support natively, converted path from %s to %s, apiName: %s", path.Path, newPath, apiName)
+		} else if apiName == provider.ApiNameAnthropicMessages {
+			// Provider supports Claude protocol natively, no conversion needed
+			log.Debugf("[Auto Protocol] Claude request detected, provider supports natively, keeping original path: %s, apiName: %s", path.Path, apiName)
+		}
 	}
 
-	// Auto-detect protocol based on request path and handle conversion if needed
-	// If request is Claude format (/v1/messages) but provider doesn't support it natively,
-	// convert to OpenAI format (/v1/chat/completions)
-	if apiName == provider.ApiNameAnthropicMessages && !providerConfig.IsSupportedAPI(provider.ApiNameAnthropicMessages) {
-		// Provider doesn't support Claude protocol natively, convert to OpenAI format
-		newPath := strings.Replace(path.Path, provider.PathAnthropicMessages, provider.PathOpenAIChatCompletions, 1)
-		_ = proxywasm.ReplaceHttpRequestHeader(":path", newPath)
-		// Update apiName to match the new path
-		apiName = provider.ApiNameChatCompletion
-		// Mark that we need to convert response back to Claude format
-		ctx.SetContext("needClaudeResponseConversion", true)
-		log.Debugf("[Auto Protocol] Claude request detected, provider doesn't support natively, converted path from %s to %s, apiName: %s", path.Path, newPath, apiName)
-	} else if apiName == provider.ApiNameAnthropicMessages {
-		// Provider supports Claude protocol natively, no conversion needed
-		log.Debugf("[Auto Protocol] Claude request detected, provider supports natively, keeping original path: %s, apiName: %s", path.Path, apiName)
-	}
-
-	if contentType, _ := proxywasm.GetHttpRequestHeader(util.HeaderContentType); contentType != "" && !strings.Contains(contentType, util.MimeTypeApplicationJson) {
+	if contentType, _ := proxywasm.GetHttpRequestHeader(util.HeaderContentType); contentType != "" && !isSupportedRequestContentType(apiName, contentType) {
 		ctx.DontReadRequestBody()
-		log.Debugf("[onHttpRequestHeader] unsupported content type: %s, will not process the request body", contentType)
+		log.Debugf("[onHttpRequestHeader] unsupported content type for api %s: %s, will not process the request body", apiName, contentType)
 	}
 
 	if apiName == "" {
@@ -247,8 +252,8 @@ func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConf
 		providerConfig.SetAvailableApiTokens(ctx)
 
 		// save the original request host and path in case they are needed for apiToken health check and retry
-		ctx.SetContext(provider.CtxRequestHost, wrapper.GetRequestHost())
-		ctx.SetContext(provider.CtxRequestPath, wrapper.GetRequestPath())
+		ctx.SetContext(provider.CtxRequestHost, ctx.Host())
+		ctx.SetContext(provider.CtxRequestPath, ctx.Path())
 
 		err := handler.OnRequestHeaders(ctx, apiName)
 		if err != nil {
@@ -256,7 +261,7 @@ func onHttpRequestHeader(ctx wrapper.HttpContext, pluginConfig config.PluginConf
 			return types.ActionContinue
 		}
 
-		hasRequestBody := wrapper.HasRequestBody()
+		hasRequestBody := ctx.HasRequestBody()
 		if hasRequestBody {
 			_ = proxywasm.RemoveHttpRequestHeader("Content-Length")
 			ctx.SetRequestBodyBufferLimit(defaultMaxBodyBytes)
@@ -304,6 +309,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, pluginConfig config.PluginConfig
 		if err == nil {
 			return action
 		}
+		log.Errorf("[onHttpRequestBody] failed to process request body, apiName=%s, err=%v", apiName, err)
 		_ = util.ErrorHandler("ai-proxy.proc_req_body_failed", fmt.Errorf("failed to process request body: %v", err))
 	}
 	return types.ActionContinue
@@ -379,6 +385,8 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, pluginConfig config.Plugin
 		return chunk
 	}
 
+	promoteThinking := pluginConfig.GetProviderConfig().GetPromoteThinkingOnEmpty()
+
 	log.Debugf("[onStreamingResponseBody] provider=%s", activeProvider.GetProviderType())
 	log.Debugf("[onStreamingResponseBody] isLastChunk=%v chunk: %s", isLastChunk, string(chunk))
 
@@ -386,6 +394,9 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, pluginConfig config.Plugin
 		apiName, _ := ctx.GetContext(provider.CtxKeyApiName).(provider.ApiName)
 		modifiedChunk, err := handler.OnStreamingResponseBody(ctx, apiName, chunk, isLastChunk)
 		if err == nil && modifiedChunk != nil {
+			if promoteThinking {
+				modifiedChunk = promoteThinkingInStreamingChunk(ctx, modifiedChunk, isLastChunk)
+			}
 			// Convert to Claude format if needed
 			claudeChunk, convertErr := convertStreamingResponseToClaude(ctx, modifiedChunk)
 			if convertErr != nil {
@@ -429,6 +440,10 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, pluginConfig config.Plugin
 
 		result := []byte(responseBuilder.String())
 
+		if promoteThinking {
+			result = promoteThinkingInStreamingChunk(ctx, result, isLastChunk)
+		}
+
 		// Convert to Claude format if needed
 		claudeChunk, convertErr := convertStreamingResponseToClaude(ctx, result)
 		if convertErr != nil {
@@ -437,11 +452,12 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, pluginConfig config.Plugin
 		return claudeChunk
 	}
 
-	if !needsClaudeResponseConversion(ctx) {
+	if !needsClaudeResponseConversion(ctx) && !promoteThinking {
 		return chunk
 	}
 
 	// If provider doesn't implement any streaming handlers but we need Claude conversion
+	// or thinking promotion
 	// First extract complete events from the chunk
 	events := provider.ExtractStreamingEvents(ctx, chunk)
 	log.Debugf("[onStreamingResponseBody] %d events received (no handler)", len(events))
@@ -457,6 +473,10 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, pluginConfig config.Plugin
 	}
 
 	result := []byte(responseBuilder.String())
+
+	if promoteThinking {
+		result = promoteThinkingInStreamingChunk(ctx, result, isLastChunk)
+	}
 
 	// Convert to Claude format if needed
 	claudeChunk, convertErr := convertStreamingResponseToClaude(ctx, result)
@@ -488,6 +508,16 @@ func onHttpResponseBody(ctx wrapper.HttpContext, pluginConfig config.PluginConfi
 		finalBody = transformedBody
 	} else {
 		finalBody = body
+	}
+
+	// Promote thinking/reasoning to content when content is empty
+	if pluginConfig.GetProviderConfig().GetPromoteThinkingOnEmpty() {
+		promoted, err := provider.PromoteThinkingOnEmptyResponse(finalBody)
+		if err != nil {
+			log.Warnf("[promoteThinkingOnEmpty] failed: %v", err)
+		} else {
+			finalBody = promoted
+		}
 	}
 
 	// Convert to Claude format if needed (applies to both branches)
@@ -536,6 +566,49 @@ func convertStreamingResponseToClaude(ctx wrapper.HttpContext, data []byte) ([]b
 		return data, err
 	}
 	return claudeChunk, nil
+}
+
+// promoteThinkingInStreamingChunk processes SSE-formatted streaming data, buffering
+// reasoning deltas and stripping them from chunks. On the last chunk, if no content
+// was ever seen, it appends a flush chunk that emits buffered reasoning as content.
+func promoteThinkingInStreamingChunk(ctx wrapper.HttpContext, data []byte, isLastChunk bool) []byte {
+	// SSE data contains lines like "data: {...}\n\n"
+	// We need to find and process each data line
+	lines := strings.Split(string(data), "\n")
+	modified := false
+	for i, line := range lines {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" || payload == "" {
+			continue
+		}
+		stripped, err := provider.PromoteStreamingThinkingOnEmptyChunk(ctx, []byte(payload))
+		if err != nil {
+			continue
+		}
+		newLine := "data: " + string(stripped)
+		if newLine != line {
+			lines[i] = newLine
+			modified = true
+		}
+	}
+
+	result := data
+	if modified {
+		result = []byte(strings.Join(lines, "\n"))
+	}
+
+	// On last chunk, flush buffered reasoning as content if no content was seen
+	if isLastChunk {
+		flushChunk := provider.PromoteStreamingThinkingFlush(ctx)
+		if flushChunk != nil {
+			result = append(flushChunk, result...)
+		}
+	}
+
+	return result
 }
 
 // Helper function to convert OpenAI response body to Claude format
@@ -591,4 +664,15 @@ func getApiName(path string) provider.ApiName {
 	}
 
 	return ""
+}
+
+func isSupportedRequestContentType(apiName provider.ApiName, contentType string) bool {
+	if strings.Contains(contentType, util.MimeTypeApplicationJson) {
+		return true
+	}
+	contentType = strings.ToLower(contentType)
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		return apiName == provider.ApiNameImageEdit || apiName == provider.ApiNameImageVariation
+	}
+	return false
 }

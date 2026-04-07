@@ -38,7 +38,7 @@ spec:
         - name: {{ .Chart.Name }}
           securityContext:
             {{- toYaml .Values.controller.securityContext | nindent 12 }}
-          image: "{{ .Values.controller.hub | default .Values.global.hub }}/{{ .Values.controller.image | default "higress" }}:{{ .Values.controller.tag | default .Chart.AppVersion }}"
+          image: "{{ .Values.controller.hub | default .Values.global.hub }}/higress/{{ .Values.controller.image | default "higress" }}:{{ .Values.controller.tag | default .Chart.AppVersion }}"
           args:
           - "serve"
           - --gatewaySelectorKey=higress
@@ -78,6 +78,10 @@ spec:
             value: "{{ .Values.global.enableGatewayAPI }}"
           - name: PILOT_ENABLE_ALPHA_GATEWAY_API
             value: "{{ .Values.global.enableGatewayAPI }}"
+          {{- if .Values.global.enableInferenceExtension }}
+          - name: ENABLE_GATEWAY_API_INFERENCE_EXTENSION
+            value: "true"
+          {{- end }}
           {{- if .Values.controller.env }}
           {{- range $key, $val := .Values.controller.env }}
           - name: {{ $key }}
@@ -100,7 +104,7 @@ spec:
           - name: log
             mountPath: /var/log
         - name: discovery
-          image: "{{ .Values.pilot.hub | default .Values.global.hub }}/{{ .Values.pilot.image | default "pilot" }}:{{ .Values.pilot.tag | default .Chart.AppVersion }}"
+          image: "{{ .Values.pilot.hub | default .Values.global.hub }}/higress/{{ .Values.pilot.image | default "pilot" }}:{{ .Values.pilot.tag | default .Chart.AppVersion }}"
 {{- if .Values.global.imagePullPolicy }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
 {{- end }}
@@ -169,12 +173,22 @@ spec:
             value: "{{ .Values.global.xdsMaxRecvMsgSize }}"
           - name: ENBALE_SCOPED_RDS
             value: "{{ .Values.global.enableSRDS }}"
+          - name: ISTIO_DELTA_XDS
+            value: "{{ .Values.global.enableDeltaXDS }}"
           - name: ON_DEMAND_RDS
             value: "{{ .Values.global.onDemandRDS }}"
           - name: HOST_RDS_MERGE_SUBSET
             value: "{{ .Values.global.hostRDSMergeSubset }}"
           - name: PILOT_FILTER_GATEWAY_CLUSTER_CONFIG
+            {{- if .Values.global.enableInferenceExtension }}
+            value: "false"
+            {{- else }}
             value: "{{ .Values.global.onlyPushRouteCluster }}"
+            {{- end }}
+          {{- if .Values.global.enableInferenceExtension }}
+          - name: ENABLE_GATEWAY_API_INFERENCE_EXTENSION
+            value: "true"
+          {{- end }}
           - name: HIGRESS_CONTROLLER_SVC
             value: "127.0.0.1"
           - name: HIGRESS_CONTROLLER_PORT
@@ -287,6 +301,10 @@ spec:
       {{- end }}
       {{- with .Values.controller.tolerations }}
       tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.topologySpreadConstraints }}
+      topologySpreadConstraints:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       volumes:

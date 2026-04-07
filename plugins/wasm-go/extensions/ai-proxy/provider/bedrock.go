@@ -35,16 +35,33 @@ const (
 	// converseStream路径 /model/{modelId}/converse-stream
 	bedrockStreamChatCompletionPath = "/model/%s/converse-stream"
 	// invoke_model 路径 /model/{modelId}/invoke
-	bedrockInvokeModelPath = "/model/%s/invoke"
-	bedrockSignedHeaders   = "host;x-amz-date"
-	requestIdHeader        = "X-Amzn-Requestid"
+	bedrockInvokeModelPath   = "/model/%s/invoke"
+	bedrockSignedHeaders     = "host;x-amz-date"
+	requestIdHeader          = "X-Amzn-Requestid"
+	bedrockCacheTypeDefault  = "default"
+	bedrockCacheTTL5m        = "5m"
+	bedrockCacheTTL1h        = "1h"
+	bedrockPromptCacheNova   = "amazon.nova"
+	bedrockPromptCacheClaude = "anthropic.claude"
+
+	bedrockCachePointPositionSystemPrompt    = "systemPrompt"
+	bedrockCachePointPositionLastUserMessage = "lastUserMessage"
+	bedrockCachePointPositionLastMessage     = "lastMessage"
+)
+
+var (
+	bedrockConversePathPattern = regexp.MustCompile(`/model/[^/]+/converse(-stream)?$`)
+	bedrockInvokePathPattern   = regexp.MustCompile(`/model/[^/]+/invoke(-with-response-stream)?$`)
 )
 
 type bedrockProviderInitializer struct{}
 
 func (b *bedrockProviderInitializer) ValidateConfig(config *ProviderConfig) error {
-	if len(config.awsAccessKey) == 0 || len(config.awsSecretKey) == 0 {
-		return errors.New("missing bedrock access authentication parameters")
+	hasAkSk := len(config.awsAccessKey) > 0 && len(config.awsSecretKey) > 0
+	hasApiToken := len(config.apiTokens) > 0
+
+	if !hasAkSk && !hasApiToken {
+		return errors.New("missing bedrock access authentication parameters: either apiTokens or (awsAccessKey + awsSecretKey) is required")
 	}
 	if len(config.awsRegion) == 0 {
 		return errors.New("missing bedrock region parameters")
@@ -161,9 +178,10 @@ func (b *bedrockProvider) convertEventFromBedrockToOpenAI(ctx wrapper.HttpContex
 	if bedrockEvent.Usage != nil {
 		openAIFormattedChunk.Choices = choices[:0]
 		openAIFormattedChunk.Usage = &usage{
-			CompletionTokens: bedrockEvent.Usage.OutputTokens,
-			PromptTokens:     bedrockEvent.Usage.InputTokens,
-			TotalTokens:      bedrockEvent.Usage.TotalTokens,
+			CompletionTokens:    bedrockEvent.Usage.OutputTokens,
+			PromptTokens:        bedrockEvent.Usage.InputTokens,
+			TotalTokens:         bedrockEvent.Usage.TotalTokens,
+			PromptTokensDetails: buildPromptTokensDetails(bedrockEvent.Usage.CacheReadInputTokens, bedrockEvent.Usage.CacheWriteInputTokens),
 		}
 	}
 	openAIFormattedChunkBytes, _ := json.Marshal(openAIFormattedChunk)
@@ -627,16 +645,43 @@ func (b *bedrockProvider) GetProviderType() string {
 	return providerTypeBedrock
 }
 
+func (b *bedrockProvider) GetApiName(path string) ApiName {
+	switch {
+	case bedrockConversePathPattern.MatchString(path):
+		return ApiNameChatCompletion
+	case bedrockInvokePathPattern.MatchString(path):
+		return ApiNameImageGeneration
+	default:
+		return ""
+	}
+}
+
 func (b *bedrockProvider) OnRequestHeaders(ctx wrapper.HttpContext, apiName ApiName) error {
 	b.config.handleRequestHeaders(b, ctx, apiName)
 	return nil
 }
 
 func (b *bedrockProvider) TransformRequestHeaders(ctx wrapper.HttpContext, apiName ApiName, headers http.Header) {
-	util.OverwriteRequestHostHeader(headers, fmt.Sprintf(bedrockDefaultDomain, b.config.awsRegion))
+	util.OverwriteRequestHostHeader(headers, fmt.Sprintf(bedrockDefaultDomain, strings.TrimSpace(b.config.awsRegion)))
+
+	// If apiTokens is configured, set Bearer token authentication here
+	// This follows the same pattern as other providers (qwen, zhipuai, etc.)
+	// AWS SigV4 authentication is handled in setAuthHeaders because it requires the request body
+	if len(b.config.apiTokens) > 0 {
+		util.OverwriteRequestAuthorizationHeader(headers, "Bearer "+b.config.GetApiTokenInUse(ctx))
+	}
 }
 
 func (b *bedrockProvider) OnRequestBody(ctx wrapper.HttpContext, apiName ApiName, body []byte) (types.Action, error) {
+	// In original protocol mode (e.g. /model/{modelId}/converse-stream), keep the body/path untouched
+	// and only apply auth headers.
+	if b.config.IsOriginal() {
+		headers := util.GetRequestHeaders()
+		b.setAuthHeaders(body, headers)
+		util.ReplaceRequestHeaders(headers)
+		return types.ActionContinue, replaceRequestBody(body)
+	}
+
 	if !b.config.isSupportedAPI(apiName) {
 		return types.ActionContinue, errUnsupportedApiName
 	}
@@ -644,14 +689,25 @@ func (b *bedrockProvider) OnRequestBody(ctx wrapper.HttpContext, apiName ApiName
 }
 
 func (b *bedrockProvider) TransformRequestBodyHeaders(ctx wrapper.HttpContext, apiName ApiName, body []byte, headers http.Header) ([]byte, error) {
+	var transformedBody []byte
+	var err error
 	switch apiName {
 	case ApiNameChatCompletion:
-		return b.onChatCompletionRequestBody(ctx, body, headers)
+		transformedBody, err = b.onChatCompletionRequestBody(ctx, body, headers)
 	case ApiNameImageGeneration:
-		return b.onImageGenerationRequestBody(ctx, body, headers)
+		transformedBody, err = b.onImageGenerationRequestBody(ctx, body, headers)
 	default:
-		return b.config.defaultTransformRequestBody(ctx, apiName, body)
+		transformedBody, err = b.config.defaultTransformRequestBody(ctx, apiName, body)
 	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Always apply auth after request body/path are finalized.
+	// For Bearer token mode this is a no-op; for AK/SK mode this generates SigV4 headers.
+	b.setAuthHeaders(transformedBody, headers)
+	return transformedBody, nil
 }
 
 func (b *bedrockProvider) TransformResponseBody(ctx wrapper.HttpContext, apiName ApiName, body []byte) ([]byte, error) {
@@ -659,18 +715,18 @@ func (b *bedrockProvider) TransformResponseBody(ctx wrapper.HttpContext, apiName
 	case ApiNameChatCompletion:
 		return b.onChatCompletionResponseBody(ctx, body)
 	case ApiNameImageGeneration:
-		return b.onImageGenerationResponseBody(ctx, body)
+		return b.onImageGenerationResponseBody(body)
 	}
 	return nil, errUnsupportedApiName
 }
 
-func (b *bedrockProvider) onImageGenerationResponseBody(ctx wrapper.HttpContext, body []byte) ([]byte, error) {
+func (b *bedrockProvider) onImageGenerationResponseBody(body []byte) ([]byte, error) {
 	bedrockResponse := &bedrockImageGenerationResponse{}
 	if err := json.Unmarshal(body, bedrockResponse); err != nil {
 		log.Errorf("unable to unmarshal bedrock image gerneration response: %v", err)
 		return nil, fmt.Errorf("unable to unmarshal bedrock image generation response: %v", err)
 	}
-	response := b.buildBedrockImageGenerationResponse(ctx, bedrockResponse)
+	response := b.buildBedrockImageGenerationResponse(bedrockResponse)
 	return json.Marshal(response)
 }
 
@@ -705,12 +761,10 @@ func (b *bedrockProvider) buildBedrockImageGenerationRequest(origRequest *imageG
 			Quality:        origRequest.Quality,
 		},
 	}
-	requestBytes, err := json.Marshal(request)
-	b.setAuthHeaders(requestBytes, headers)
-	return requestBytes, err
+	return json.Marshal(request)
 }
 
-func (b *bedrockProvider) buildBedrockImageGenerationResponse(ctx wrapper.HttpContext, bedrockResponse *bedrockImageGenerationResponse) *imageGenerationResponse {
+func (b *bedrockProvider) buildBedrockImageGenerationResponse(bedrockResponse *bedrockImageGenerationResponse) *imageGenerationResponse {
 	data := make([]imageGenerationData, len(bedrockResponse.Images))
 	for i, image := range bedrockResponse.Images {
 		data[i] = imageGenerationData{
@@ -759,7 +813,15 @@ func (b *bedrockProvider) buildBedrockTextGenerationRequest(origRequest *chatCom
 		case roleSystem:
 			systemMessages = append(systemMessages, systemContentBlock{Text: msg.StringContent()})
 		case roleTool:
-			messages = append(messages, chatToolMessage2BedrockMessage(msg))
+			toolResultContent := chatToolMessage2BedrockToolResultContent(msg)
+			if len(messages) > 0 && messages[len(messages)-1].Role == roleUser && messages[len(messages)-1].Content[0].ToolResult != nil {
+				messages[len(messages)-1].Content = append(messages[len(messages)-1].Content, toolResultContent)
+			} else {
+				messages = append(messages, bedrockMessage{
+					Role:    roleUser,
+					Content: []bedrockMessageContent{toolResultContent},
+				})
+			}
 		default:
 			messages = append(messages, chatMessage2BedrockMessage(msg))
 		}
@@ -777,6 +839,19 @@ func (b *bedrockProvider) buildBedrockTextGenerationRequest(origRequest *chatCom
 		PerformanceConfig: PerformanceConfiguration{
 			Latency: "standard",
 		},
+	}
+
+	effectivePromptCacheRetention := b.resolvePromptCacheRetention(origRequest.PromptCacheRetention)
+
+	if origRequest.PromptCacheKey != "" {
+		log.Warnf("bedrock provider ignores prompt_cache_key because Converse API has no equivalent field")
+	}
+	if isPromptCacheSupportedModel(origRequest.Model) {
+		if cacheTTL, ok := mapPromptCacheRetentionToBedrockTTL(effectivePromptCacheRetention); ok {
+			addPromptCachePointsToBedrockRequest(request, cacheTTL, b.getPromptCachePointPositions())
+		}
+	} else if effectivePromptCacheRetention != "" {
+		log.Warnf("skip prompt cache injection for unsupported model: %s", origRequest.Model)
 	}
 
 	if origRequest.ReasoningEffort != "" {
@@ -829,9 +904,7 @@ func (b *bedrockProvider) buildBedrockTextGenerationRequest(origRequest *chatCom
 		request.AdditionalModelRequestFields[key] = value
 	}
 
-	requestBytes, err := json.Marshal(request)
-	b.setAuthHeaders(requestBytes, headers)
-	return requestBytes, err
+	return json.Marshal(request)
 }
 
 func (b *bedrockProvider) buildChatCompletionResponse(ctx wrapper.HttpContext, bedrockResponse *bedrockConverseResponse) *chatCompletionResponse {
@@ -882,9 +955,10 @@ func (b *bedrockProvider) buildChatCompletionResponse(ctx wrapper.HttpContext, b
 		Object:            objectChatCompletion,
 		Choices:           choices,
 		Usage: &usage{
-			PromptTokens:     bedrockResponse.Usage.InputTokens,
-			CompletionTokens: bedrockResponse.Usage.OutputTokens,
-			TotalTokens:      bedrockResponse.Usage.TotalTokens,
+			PromptTokens:        bedrockResponse.Usage.InputTokens,
+			CompletionTokens:    bedrockResponse.Usage.OutputTokens,
+			TotalTokens:         bedrockResponse.Usage.TotalTokens,
+			PromptTokensDetails: buildPromptTokensDetails(bedrockResponse.Usage.CacheReadInputTokens, bedrockResponse.Usage.CacheWriteInputTokens),
 		},
 	}
 }
@@ -912,6 +986,145 @@ func stopReasonBedrock2OpenAI(reason string) string {
 		return finishReasonToolCall
 	default:
 		return reason
+	}
+}
+
+func mapPromptCacheRetentionToBedrockTTL(retention string) (string, bool) {
+	normalizedRetention := normalizePromptCacheRetention(retention)
+	switch normalizedRetention {
+	case "":
+		return "", false
+	case "in_memory":
+		// For the default 5-minute cache, omit ttl and let Bedrock apply its default.
+		// This is more robust for models that are strict about explicit ttl fields.
+		return "", true
+	case "24h":
+		return bedrockCacheTTL1h, true
+	default:
+		log.Warnf("unsupported prompt_cache_retention for bedrock mapping: %s", retention)
+		return "", false
+	}
+}
+
+func normalizePromptCacheRetention(retention string) string {
+	normalized := strings.ToLower(strings.TrimSpace(retention))
+	normalized = strings.ReplaceAll(normalized, "-", "_")
+	normalized = strings.ReplaceAll(normalized, " ", "_")
+	if normalized == "inmemory" {
+		return "in_memory"
+	}
+	return normalized
+}
+
+func isPromptCacheSupportedModel(model string) bool {
+	normalizedModel := strings.ToLower(strings.TrimSpace(model))
+	return strings.Contains(normalizedModel, bedrockPromptCacheNova) ||
+		strings.Contains(normalizedModel, bedrockPromptCacheClaude)
+}
+
+func (b *bedrockProvider) resolvePromptCacheRetention(requestPromptCacheRetention string) string {
+	if requestPromptCacheRetention != "" {
+		return requestPromptCacheRetention
+	}
+	if b.config.promptCacheRetention != "" {
+		return b.config.promptCacheRetention
+	}
+	return ""
+}
+
+func (b *bedrockProvider) getPromptCachePointPositions() map[string]bool {
+	if b.config.bedrockPromptCachePointPositions == nil {
+		return map[string]bool{
+			bedrockCachePointPositionSystemPrompt: true,
+			bedrockCachePointPositionLastMessage:  false,
+		}
+	}
+	positions := map[string]bool{
+		bedrockCachePointPositionSystemPrompt:    false,
+		bedrockCachePointPositionLastUserMessage: false,
+		bedrockCachePointPositionLastMessage:     false,
+	}
+	for rawKey, enabled := range b.config.bedrockPromptCachePointPositions {
+		key := normalizeBedrockCachePointPosition(rawKey)
+		switch key {
+		case bedrockCachePointPositionSystemPrompt, bedrockCachePointPositionLastUserMessage, bedrockCachePointPositionLastMessage:
+			positions[key] = enabled
+		default:
+			log.Warnf("unsupported bedrockPromptCachePointPositions key: %s", rawKey)
+		}
+	}
+	return positions
+}
+
+func normalizeBedrockCachePointPosition(raw string) string {
+	key := strings.ToLower(raw)
+	key = strings.ReplaceAll(key, "_", "")
+	key = strings.ReplaceAll(key, "-", "")
+	switch key {
+	case "systemprompt":
+		return bedrockCachePointPositionSystemPrompt
+	case "lastusermessage":
+		return bedrockCachePointPositionLastUserMessage
+	case "lastmessage":
+		return bedrockCachePointPositionLastMessage
+	default:
+		return raw
+	}
+}
+
+func addPromptCachePointsToBedrockRequest(request *bedrockTextGenRequest, cacheTTL string, positions map[string]bool) {
+	if positions[bedrockCachePointPositionSystemPrompt] && len(request.System) > 0 {
+		request.System = append(request.System, systemContentBlock{
+			CachePoint: &bedrockCachePoint{
+				Type: bedrockCacheTypeDefault,
+				TTL:  cacheTTL,
+			},
+		})
+	}
+
+	lastUserMessageIndex := -1
+	if positions[bedrockCachePointPositionLastUserMessage] {
+		lastUserMessageIndex = findLastMessageIndexByRole(request.Messages, roleUser)
+		if lastUserMessageIndex >= 0 {
+			appendCachePointToBedrockMessage(request, lastUserMessageIndex, cacheTTL)
+		}
+	}
+	if positions[bedrockCachePointPositionLastMessage] && len(request.Messages) > 0 {
+		lastMessageIndex := len(request.Messages) - 1
+		if lastMessageIndex != lastUserMessageIndex {
+			appendCachePointToBedrockMessage(request, lastMessageIndex, cacheTTL)
+		}
+	}
+}
+
+func findLastMessageIndexByRole(messages []bedrockMessage, role string) int {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == role {
+			return i
+		}
+	}
+	return -1
+}
+
+func appendCachePointToBedrockMessage(request *bedrockTextGenRequest, messageIndex int, cacheTTL string) {
+	if messageIndex < 0 || messageIndex >= len(request.Messages) {
+		return
+	}
+	request.Messages[messageIndex].Content = append(request.Messages[messageIndex].Content, bedrockMessageContent{
+		CachePoint: &bedrockCachePoint{
+			Type: bedrockCacheTypeDefault,
+			TTL:  cacheTTL,
+		},
+	})
+}
+
+func buildPromptTokensDetails(cacheReadInputTokens int, cacheWriteInputTokens int) *promptTokensDetails {
+	totalCachedTokens := cacheReadInputTokens + cacheWriteInputTokens
+	if totalCachedTokens <= 0 {
+		return nil
+	}
+	return &promptTokensDetails{
+		CachedTokens: totalCachedTokens,
 	}
 }
 
@@ -959,14 +1172,21 @@ type bedrockMessage struct {
 }
 
 type bedrockMessageContent struct {
-	Text       string           `json:"text,omitempty"`
-	Image      *imageBlock      `json:"image,omitempty"`
-	ToolResult *toolResultBlock `json:"toolResult,omitempty"`
-	ToolUse    *toolUseBlock    `json:"toolUse,omitempty"`
+	Text       string             `json:"text,omitempty"`
+	Image      *imageBlock        `json:"image,omitempty"`
+	ToolResult *toolResultBlock   `json:"toolResult,omitempty"`
+	ToolUse    *toolUseBlock      `json:"toolUse,omitempty"`
+	CachePoint *bedrockCachePoint `json:"cachePoint,omitempty"`
 }
 
 type systemContentBlock struct {
-	Text string `json:"text,omitempty"`
+	Text       string             `json:"text,omitempty"`
+	CachePoint *bedrockCachePoint `json:"cachePoint,omitempty"`
+}
+
+type bedrockCachePoint struct {
+	Type string `json:"type"`
+	TTL  string `json:"ttl,omitempty"`
 }
 
 type imageBlock struct {
@@ -1048,9 +1268,13 @@ type tokenUsage struct {
 	OutputTokens int `json:"outputTokens,omitempty"`
 
 	TotalTokens int `json:"totalTokens"`
+
+	CacheReadInputTokens int `json:"cacheReadInputTokens,omitempty"`
+
+	CacheWriteInputTokens int `json:"cacheWriteInputTokens,omitempty"`
 }
 
-func chatToolMessage2BedrockMessage(chatMessage chatMessage) bedrockMessage {
+func chatToolMessage2BedrockToolResultContent(chatMessage chatMessage) bedrockMessageContent {
 	toolResultContent := &toolResultBlock{}
 	toolResultContent.ToolUseId = chatMessage.ToolCallId
 	if text, ok := chatMessage.Content.(string); ok {
@@ -1059,41 +1283,43 @@ func chatToolMessage2BedrockMessage(chatMessage chatMessage) bedrockMessage {
 				Text: text,
 			},
 		}
-		openaiContent := chatMessage.ParseContent()
-		for _, part := range openaiContent {
-			var content bedrockMessageContent
-			if part.Type == contentTypeText {
-				content.Text = part.Text
-			} else {
-				continue
+	} else if contentList, ok := chatMessage.Content.([]any); ok {
+		for _, contentItem := range contentList {
+			contentMap, ok := contentItem.(map[string]any)
+			if ok && contentMap["type"] == contentTypeText {
+				if text, ok := contentMap[contentTypeText].(string); ok {
+					toolResultContent.Content = append(toolResultContent.Content, toolResultContentBlock{
+						Text: text,
+					})
+				}
 			}
 		}
 	} else {
-		log.Warnf("only text content is supported, current content is %v", chatMessage.Content)
+		log.Warnf("the content type is not supported, current content is %v", chatMessage.Content)
 	}
-	return bedrockMessage{
-		Role: roleUser,
-		Content: []bedrockMessageContent{
-			{
-				ToolResult: toolResultContent,
-			},
-		},
+	return bedrockMessageContent{
+		ToolResult: toolResultContent,
 	}
 }
 
 func chatMessage2BedrockMessage(chatMessage chatMessage) bedrockMessage {
 	var result bedrockMessage
 	if len(chatMessage.ToolCalls) > 0 {
+		contents := make([]bedrockMessageContent, 0, len(chatMessage.ToolCalls))
+		for _, toolCall := range chatMessage.ToolCalls {
+			params := map[string]interface{}{}
+			json.Unmarshal([]byte(toolCall.Function.Arguments), &params)
+			contents = append(contents, bedrockMessageContent{
+				ToolUse: &toolUseBlock{
+					Input:     params,
+					Name:      toolCall.Function.Name,
+					ToolUseId: toolCall.Id,
+				},
+			})
+		}
 		result = bedrockMessage{
 			Role:    chatMessage.Role,
-			Content: []bedrockMessageContent{{}},
-		}
-		params := map[string]interface{}{}
-		json.Unmarshal([]byte(chatMessage.ToolCalls[0].Function.Arguments), &params)
-		result.Content[0].ToolUse = &toolUseBlock{
-			Input:     params,
-			Name:      chatMessage.ToolCalls[0].Function.Name,
-			ToolUseId: chatMessage.ToolCalls[0].Id,
+			Content: contents,
 		}
 	} else if chatMessage.IsStringContent() {
 		result = bedrockMessage{
@@ -1136,35 +1362,52 @@ func chatMessage2BedrockMessage(chatMessage chatMessage) bedrockMessage {
 }
 
 func (b *bedrockProvider) setAuthHeaders(body []byte, headers http.Header) {
+	// Bearer token authentication is already set in TransformRequestHeaders
+	// This function only handles AWS SigV4 authentication which requires the request body
+	if len(b.config.apiTokens) > 0 {
+		return
+	}
+
+	// Use AWS Signature V4 authentication
+	accessKey := strings.TrimSpace(b.config.awsAccessKey)
+	region := strings.TrimSpace(b.config.awsRegion)
 	t := time.Now().UTC()
 	amzDate := t.Format("20060102T150405Z")
 	dateStamp := t.Format("20060102")
 	path := headers.Get(":path")
 	signature := b.generateSignature(path, amzDate, dateStamp, body)
 	headers.Set("X-Amz-Date", amzDate)
-	util.OverwriteRequestAuthorizationHeader(headers, fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s/%s/%s/aws4_request, SignedHeaders=%s, Signature=%s", b.config.awsAccessKey, dateStamp, b.config.awsRegion, awsService, bedrockSignedHeaders, signature))
+	util.OverwriteRequestAuthorizationHeader(headers, fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s/%s/%s/aws4_request, SignedHeaders=%s, Signature=%s", accessKey, dateStamp, region, awsService, bedrockSignedHeaders, signature))
 }
 
 func (b *bedrockProvider) generateSignature(path, amzDate, dateStamp string, body []byte) string {
-	path = encodeSigV4Path(path)
+	canonicalURI := encodeSigV4Path(path)
 	hashedPayload := sha256Hex(body)
+	region := strings.TrimSpace(b.config.awsRegion)
+	secretKey := strings.TrimSpace(b.config.awsSecretKey)
 
-	endpoint := fmt.Sprintf(bedrockDefaultDomain, b.config.awsRegion)
+	endpoint := fmt.Sprintf(bedrockDefaultDomain, region)
 	canonicalHeaders := fmt.Sprintf("host:%s\nx-amz-date:%s\n", endpoint, amzDate)
 	canonicalRequest := fmt.Sprintf("%s\n%s\n\n%s\n%s\n%s",
-		httpPostMethod, path, canonicalHeaders, bedrockSignedHeaders, hashedPayload)
+		httpPostMethod, canonicalURI, canonicalHeaders, bedrockSignedHeaders, hashedPayload)
 
-	credentialScope := fmt.Sprintf("%s/%s/%s/aws4_request", dateStamp, b.config.awsRegion, awsService)
+	credentialScope := fmt.Sprintf("%s/%s/%s/aws4_request", dateStamp, region, awsService)
 	hashedCanonReq := sha256Hex([]byte(canonicalRequest))
 	stringToSign := fmt.Sprintf("AWS4-HMAC-SHA256\n%s\n%s\n%s",
 		amzDate, credentialScope, hashedCanonReq)
 
-	signingKey := getSignatureKey(b.config.awsSecretKey, dateStamp, b.config.awsRegion, awsService)
+	signingKey := getSignatureKey(secretKey, dateStamp, region, awsService)
 	signature := hmacHex(signingKey, stringToSign)
 	return signature
 }
 
 func encodeSigV4Path(path string) string {
+	// Keep only the URI path for canonical URI. Query string is handled separately in SigV4,
+	// and this implementation uses an empty canonical query string.
+	if queryIndex := strings.Index(path, "?"); queryIndex >= 0 {
+		path = path[:queryIndex]
+	}
+
 	segments := strings.Split(path, "/")
 	for i, seg := range segments {
 		if seg == "" {
