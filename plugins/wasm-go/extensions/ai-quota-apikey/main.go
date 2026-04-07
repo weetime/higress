@@ -91,7 +91,8 @@ type QuotaConfig struct {
 	HashApiKey       bool   // 是否对 API Key 进行哈希
 
 	// 路由配置
-	RuleName string // 从 matchRules 配置中获取的规则名称
+	RuleName  string   // 从 matchRules 配置中获取的规则名称
+	QuotaPaths []string // 需要进行配额检查的请求路径列表
 }
 
 // RedisInfo Redis 连接信息
@@ -157,6 +158,19 @@ func parseConfig(json gjson.Result, config *QuotaConfig) error {
 	}
 
 	config.HashApiKey = json.Get("hash_api_key").Bool()
+
+	// 配额检查路径配置
+	quotaPaths := json.Get("quota_paths")
+	if quotaPaths.Exists() && quotaPaths.IsArray() {
+		for _, p := range quotaPaths.Array() {
+			if s := p.String(); s != "" {
+				config.QuotaPaths = append(config.QuotaPaths, s)
+			}
+		}
+	}
+	if len(config.QuotaPaths) == 0 {
+		config.QuotaPaths = []string{"/v1/chat/completions"}
+	}
 
 	// Redis 配置
 	config.RedisKeyPrefix = json.Get("redis_key_prefix").String()
@@ -404,10 +418,10 @@ func parseRequestBody(body string) (map[string]string, error) {
 // ============================================================================
 
 // getOperationMode 根据请求路径判断操作模式
-func getOperationMode(path string, adminPath string) (ChatMode, AdminMode) {
+func getOperationMode(path string, config QuotaConfig) (ChatMode, AdminMode) {
 	// 管理接口路径格式: /ai-quota-manager{admin_path}/refresh 或 /ai-quota-manager{admin_path}/list
 	// 例如: /ai-quota-manager/quota-manager/refresh
-	fullAdminPath := "/ai-quota-manager" + adminPath
+	fullAdminPath := "/ai-quota-manager" + config.AdminPath
 
 	if strings.HasSuffix(path, fullAdminPath+"/refresh") {
 		return ChatModeAdmin, AdminModeRefresh
@@ -418,9 +432,11 @@ func getOperationMode(path string, adminPath string) (ChatMode, AdminMode) {
 	if strings.HasSuffix(path, fullAdminPath+"/delete") {
 		return ChatModeAdmin, AdminModeDelete
 	}
-	// 业务接口路径: /v1/chat/completions
-	if strings.HasSuffix(path, "/v1/chat/completions") {
-		return ChatModeCompletion, AdminModeNone
+	// 业务接口路径: 匹配配置的 quota_paths
+	for _, p := range config.QuotaPaths {
+		if strings.HasSuffix(path, p) {
+			return ChatModeCompletion, AdminModeNone
+		}
 	}
 	return ChatModeNone, AdminModeNone
 }
@@ -436,7 +452,7 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config QuotaConfig) types.Act
 
 	rawPath := ctx.Path()
 	path, _ := url.Parse(rawPath)
-	chatMode, adminMode := getOperationMode(path.Path, config.AdminPath)
+	chatMode, adminMode := getOperationMode(path.Path, config)
 
 	// 非 AI 相关请求，跳过处理
 	if chatMode == ChatModeNone {

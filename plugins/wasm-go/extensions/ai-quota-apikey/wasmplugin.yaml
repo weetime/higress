@@ -98,6 +98,22 @@ spec:
     #   - false: Redis key 为 {prefix}{api_key}，可能包含特殊字符
     hash_api_key: false
 
+    # ========================================
+    # 可选配置项：配额检查路径
+    # ========================================
+    # quota_paths: 需要进行配额检查的请求路径列表
+    #   默认值: ["/v1/chat/completions"]
+    #   支持配置多个路径，匹配方式为路径后缀匹配（HasSuffix）
+    #   常见路径:
+    #     - /v1/chat/completions  （聊天补全）
+    #     - /v1/embeddings        （向量嵌入）
+    #     - /v1/completions       （文本补全）
+    #     - /rerank               （重排序）
+    quota_paths:
+      - /v1/chat/completions
+      - /v1/embeddings
+      - /rerank
+
   matchRules: [] # 路由级别配置可以覆盖默认配置
   # - config:
   #     rule_name: infer-e43c2026-052b-4544-82fd-38da299a2a4e
@@ -111,5 +127,5 @@ spec:
   # For local testing, use file:// URL
   # url: file:///opt/plugins/wasm-go/extensions/ai-quota-apikey/plugin.wasm
   # For production, use OCI registry
-  url: oci://quanzhenglong.com/camp/ai-quota-apikey:v0.0.17
+  url: oci://quanzhenglong.com/camp/ai-quota-apikey:v0.0.18
 
