@@ -18,8 +18,10 @@ const (
 
 	// Context keys
 	ctxKeySkipProcessing = "skip_processing"
-	ctxKeyIsRerank       = "is_rerank"
-	ctxKeyRerankModel    = "rerank_model"
+	ctxKeyIsRerank        = "is_rerank"
+	ctxKeyRerankModel     = "rerank_model"
+	ctxKeyComputeTokens   = "compute_tokens"
+	ctxKeyRerankBuffer    = "rerank_buffer"
 
 	// JSON field names
 	fieldModel              = "model"
@@ -52,7 +54,7 @@ func init() {
 		wrapper.ProcessRequestHeadersBy(onHttpRequestHeaders),
 		wrapper.ProcessRequestBodyBy(onHttpRequestBody),
 		wrapper.ProcessResponseHeadersBy(onHttpResponseHeaders),
-		wrapper.ProcessResponseBodyBy(onHttpResponseBody),
+		wrapper.ProcessStreamingResponseBodyBy(onHttpStreamingResponseBody),
 	)
 }
 
@@ -104,18 +106,20 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig, log log.
 
 	path, _ := proxywasm.GetHttpRequestHeader(":path")
 
-	// Check if this is a rerank request
+	// Check if this is a rerank request — needs request body (model name) and response body processing
 	if isRerankPath(path) {
 		log.Infof("[%s] detected rerank request: %s", pluginName, path)
 		ctx.SetContext(ctxKeyIsRerank, true)
 		return types.ActionContinue
 	}
 
+	// Non-rerank paths: only need request body processing (stream usage injection)
+	ctx.DontReadResponseBody()
+
 	if !isPathEnabled(path, config.EnablePathSuffixes) {
 		log.Debugf("[%s] skipping path %s (not in enabled suffixes)", pluginName, path)
 		ctx.SetContext(ctxKeySkipProcessing, true)
 		ctx.DontReadRequestBody()
-		ctx.DontReadResponseBody()
 	}
 	return types.ActionContinue
 }
@@ -153,29 +157,49 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 }
 
 // onHttpResponseHeaders handles the response headers phase.
+// Only processes rerank responses — non-rerank paths already called DontReadResponseBody in request headers.
 func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig, log log.Log) types.Action {
 	if !ctx.GetBoolContext(ctxKeyIsRerank, false) {
-		ctx.DontReadResponseBody()
 		return types.ActionContinue
 	}
-	// For rerank responses, remove content-length since we'll modify the body
+	// Read x-compute-tokens header and save to context (cannot read response headers in body phase)
+	if tokenHeader, err := proxywasm.GetHttpResponseHeader(headerComputeTokens); err == nil && tokenHeader != "" {
+		if v, err := strconv.Atoi(tokenHeader); err == nil {
+			ctx.SetContext(ctxKeyComputeTokens, v)
+			log.Infof("[%s] got %s: %d", pluginName, headerComputeTokens, v)
+		}
+	}
+	// Remove content-length since we'll modify the body
 	proxywasm.RemoveHttpResponseHeader("content-length")
 	return types.ActionContinue
 }
 
-// onHttpResponseBody handles the response body phase.
+// onHttpStreamingResponseBody handles the streaming response body phase.
 // For rerank requests, it wraps the raw array response with usage info from TEI headers.
-func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, body []byte, log log.Log) types.Action {
+// Using streaming mode ensures the modified body is visible to downstream plugins (ai-statistics, ai-quota-apikey).
+func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data []byte, endOfStream bool, log log.Log) []byte {
 	if !ctx.GetBoolContext(ctxKeyIsRerank, false) {
-		return types.ActionContinue
+		return data
 	}
 
-	// Get token count from TEI response header (set during response headers phase)
+	// For non-streaming rerank responses, buffer chunks until endOfStream
+	if !endOfStream {
+		buf, _ := ctx.GetContext(ctxKeyRerankBuffer).([]byte)
+		buf = append(buf, data...)
+		ctx.SetContext(ctxKeyRerankBuffer, buf)
+		return nil // don't send anything downstream yet
+	}
+
+	// endOfStream: assemble the full body
+	body := data
+	if buf, ok := ctx.GetContext(ctxKeyRerankBuffer).([]byte); ok && len(buf) > 0 {
+		body = append(buf, data...)
+	}
+
+	// Get token count saved from response headers phase
 	computeTokens := 0
-	if tokenHeader, err := proxywasm.GetHttpResponseHeader(headerComputeTokens); err == nil && tokenHeader != "" {
-		if v, err := strconv.Atoi(tokenHeader); err == nil {
-			computeTokens = v
-		}
+	if v := ctx.GetContext(ctxKeyComputeTokens); v != nil {
+		computeTokens = v.(int)
 	}
 
 	// Get model name saved from request phase
@@ -186,15 +210,16 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, body []byt
 
 	log.Infof("[%s] rerank response: model=%s, compute_tokens=%d", pluginName, modelName, computeTokens)
 
-	// Build the enriched response with usage info
-	// Original TEI response: [{"index":0,"score":0.99}, ...]
-	// New response: {"results":[...], "model":"...", "usage":{"prompt_tokens":N,"total_tokens":N}}
-	newBody := buildRerankResponseWithUsage(body, modelName, computeTokens)
-
-	if err := proxywasm.ReplaceHttpResponseBody(newBody); err != nil {
-		log.Errorf("[%s] failed to replace rerank response body: %v", pluginName, err)
+	// If response already contains "usage", it's from a standard-compliant engine (vLLM, Cohere, Jina, TEI v1.10+)
+	// No transformation needed — pass through as-is
+	if gjson.GetBytes(body, "usage").Exists() || gjson.GetBytes(body, "meta.tokens").Exists() {
+		log.Infof("[%s] rerank response already contains usage, skipping transformation", pluginName)
+		return body
 	}
-	return types.ActionContinue
+
+	// TEI raw array response: [{"index":0,"score":0.99}, ...]
+	// Transform to standard format with usage info from x-compute-tokens header
+	return buildRerankResponseWithUsage(body, modelName, computeTokens)
 }
 
 // buildRerankResponseWithUsage wraps the TEI rerank array response into an object with usage info.

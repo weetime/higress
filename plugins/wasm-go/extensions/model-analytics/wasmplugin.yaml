@@ -11,7 +11,7 @@ metadata:
     higress.io/wasm-plugin-built-in: "false"
     higress.io/wasm-plugin-category: custom
     higress.io/wasm-plugin-name: model-analytics
-    higress.io/wasm-plugin-version: 0.0.2
+    higress.io/wasm-plugin-version: 0.0.5
 spec:
   defaultConfig:
     # ========================================
@@ -39,9 +39,9 @@ spec:
   defaultConfigDisable: false
   failStrategy: FAIL_OPEN
   imagePullPolicy: IfNotPresent
-  phase: STATS
-  priority: 10
+  phase: UNSPECIFIED_PHASE
+  priority: 100
   # For local testing, use file:// URL
   # url: file:///opt/plugins/wasm-go/extensions/model-analytics/plugin.wasm
   # For production, use OCI registry
-  url: oci://quanzhenglong.com/camp/model-analytics:v0.0.2
+  url: oci://quanzhenglong.com/camp/model-analytics:v0.0.5
