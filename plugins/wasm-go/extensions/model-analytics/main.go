@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
@@ -16,11 +18,16 @@ const (
 
 	// Context keys
 	ctxKeySkipProcessing = "skip_processing"
+	ctxKeyIsRerank       = "is_rerank"
+	ctxKeyRerankModel    = "rerank_model"
 
 	// JSON field names
 	fieldModel              = "model"
 	fieldStream             = "stream"
 	fieldStreamOptionsUsage = "stream_options.include_usage"
+
+	// Response headers from TEI
+	headerComputeTokens = "x-compute-tokens"
 
 	// Default values
 	defaultBlacklistPrefix = "gen-studio"
@@ -44,6 +51,8 @@ func init() {
 		wrapper.ParseConfigBy(parseConfig),
 		wrapper.ProcessRequestHeadersBy(onHttpRequestHeaders),
 		wrapper.ProcessRequestBodyBy(onHttpRequestBody),
+		wrapper.ProcessResponseHeadersBy(onHttpResponseHeaders),
+		wrapper.ProcessResponseBodyBy(onHttpResponseBody),
 	)
 }
 
@@ -94,10 +103,19 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig, log log.
 	}
 
 	path, _ := proxywasm.GetHttpRequestHeader(":path")
+
+	// Check if this is a rerank request
+	if isRerankPath(path) {
+		log.Infof("[%s] detected rerank request: %s", pluginName, path)
+		ctx.SetContext(ctxKeyIsRerank, true)
+		return types.ActionContinue
+	}
+
 	if !isPathEnabled(path, config.EnablePathSuffixes) {
 		log.Debugf("[%s] skipping path %s (not in enabled suffixes)", pluginName, path)
 		ctx.SetContext(ctxKeySkipProcessing, true)
 		ctx.DontReadRequestBody()
+		ctx.DontReadResponseBody()
 	}
 	return types.ActionContinue
 }
@@ -109,6 +127,13 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 	}
 
 	modelName := gjson.GetBytes(body, fieldModel).String()
+
+	// For rerank requests, save model name for response processing
+	if ctx.GetBoolContext(ctxKeyIsRerank, false) {
+		ctx.SetContext(ctxKeyRerankModel, modelName)
+		log.Infof("[%s] rerank request model: %s", pluginName, modelName)
+		return types.ActionContinue
+	}
 
 	// Check whitelist first (exact match) - skip if matched
 	if isInWhitelist(modelName, config.ModelWhitelist) {
@@ -125,6 +150,92 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 	}
 
 	return types.ActionContinue
+}
+
+// onHttpResponseHeaders handles the response headers phase.
+func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig, log log.Log) types.Action {
+	if !ctx.GetBoolContext(ctxKeyIsRerank, false) {
+		ctx.DontReadResponseBody()
+		return types.ActionContinue
+	}
+	// For rerank responses, remove content-length since we'll modify the body
+	proxywasm.RemoveHttpResponseHeader("content-length")
+	return types.ActionContinue
+}
+
+// onHttpResponseBody handles the response body phase.
+// For rerank requests, it wraps the raw array response with usage info from TEI headers.
+func onHttpResponseBody(ctx wrapper.HttpContext, config PluginConfig, body []byte, log log.Log) types.Action {
+	if !ctx.GetBoolContext(ctxKeyIsRerank, false) {
+		return types.ActionContinue
+	}
+
+	// Get token count from TEI response header (set during response headers phase)
+	computeTokens := 0
+	if tokenHeader, err := proxywasm.GetHttpResponseHeader(headerComputeTokens); err == nil && tokenHeader != "" {
+		if v, err := strconv.Atoi(tokenHeader); err == nil {
+			computeTokens = v
+		}
+	}
+
+	// Get model name saved from request phase
+	modelName := ""
+	if v := ctx.GetContext(ctxKeyRerankModel); v != nil {
+		modelName = v.(string)
+	}
+
+	log.Infof("[%s] rerank response: model=%s, compute_tokens=%d", pluginName, modelName, computeTokens)
+
+	// Build the enriched response with usage info
+	// Original TEI response: [{"index":0,"score":0.99}, ...]
+	// New response: {"results":[...], "model":"...", "usage":{"prompt_tokens":N,"total_tokens":N}}
+	newBody := buildRerankResponseWithUsage(body, modelName, computeTokens)
+
+	if err := proxywasm.ReplaceHttpResponseBody(newBody); err != nil {
+		log.Errorf("[%s] failed to replace rerank response body: %v", pluginName, err)
+	}
+	return types.ActionContinue
+}
+
+// buildRerankResponseWithUsage wraps the TEI rerank array response into an object with usage info.
+// Output follows the Jina/OpenAI-compatible rerank response format.
+func buildRerankResponseWithUsage(body []byte, model string, promptTokens int) []byte {
+	// Normalize TEI results: rename "score" → "relevance_score"
+	normalizedResults := normalizeRerankResults(body)
+
+	result := []byte("{}")
+	if model != "" {
+		result, _ = sjson.SetBytes(result, "model", model)
+	}
+	result, _ = sjson.SetBytes(result, "object", "list")
+	result, _ = sjson.SetRawBytes(result, "results", normalizedResults)
+	result, _ = sjson.SetBytes(result, "usage.prompt_tokens", promptTokens)
+	result, _ = sjson.SetBytes(result, "usage.total_tokens", promptTokens)
+
+	return result
+}
+
+// normalizeRerankResults renames "score" to "relevance_score" in each result item.
+// TEI returns: [{"index":0,"score":0.99}]
+// Standard:   [{"index":0,"relevance_score":0.99}]
+func normalizeRerankResults(body []byte) []byte {
+	items := gjson.ParseBytes(body).Array()
+	if len(items) == 0 {
+		return body
+	}
+
+	result := body
+	for i := len(items) - 1; i >= 0; i-- {
+		score := items[i].Get("score")
+		if !score.Exists() {
+			continue
+		}
+		path := fmt.Sprintf("%d.relevance_score", i)
+		result, _ = sjson.SetBytes(result, path, score.Float())
+		deletePath := fmt.Sprintf("%d.score", i)
+		result, _ = sjson.DeleteBytes(result, deletePath)
+	}
+	return result
 }
 
 // isInWhitelist checks if model name exactly matches any whitelist entry.
@@ -145,6 +256,14 @@ func isInBlacklist(modelName string, prefixes []string) bool {
 		}
 	}
 	return false
+}
+
+// isRerankPath checks if the request path is a rerank endpoint.
+func isRerankPath(path string) bool {
+	if idx := strings.Index(path, "?"); idx != -1 {
+		path = path[:idx]
+	}
+	return strings.HasSuffix(path, "/rerank")
 }
 
 // isPathEnabled checks if the request path matches any enabled suffix.
