@@ -289,7 +289,9 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config RouteAuthConfig, log l
 	if len(apiKey) > 8 {
 		apiKeySuffix = apiKey[len(apiKey)-8:]
 	}
-	_ = proxywasm.ReplaceHttpRequestHeader("x-api-key-name", userName+"/"+apiKeySuffix)
+	consumerValue := userName + "/" + apiKeySuffix
+	_ = proxywasm.ReplaceHttpRequestHeader("x-api-key-name", consumerValue)
+	_ = proxywasm.ReplaceHttpRequestHeader("x-mse-consumer", consumerValue)
 	log.Debugf("set consumer header: user=%s", userName)
 
 	// Step 5: 权限验证（三级鉴权）
