@@ -17,11 +17,14 @@ const (
 	pluginName = "model-analytics"
 
 	// Context keys
-	ctxKeySkipProcessing = "skip_processing"
+	ctxKeySkipProcessing  = "skip_processing"
 	ctxKeyIsRerank        = "is_rerank"
 	ctxKeyRerankModel     = "rerank_model"
 	ctxKeyComputeTokens   = "compute_tokens"
 	ctxKeyRerankBuffer    = "rerank_buffer"
+	ctxKeyIsEmbedding     = "is_embedding"
+	ctxKeyEmbeddingModel  = "embedding_model"
+	ctxKeyEmbeddingBuffer = "embedding_buffer"
 
 	// JSON field names
 	fieldModel              = "model"
@@ -108,7 +111,16 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig, log log.
 		return types.ActionContinue
 	}
 
-	// Non-rerank paths: only need request body processing (stream usage injection)
+	// Check if this is an embedding request — needs to rewrite the response body's model field
+	// so that downstream metrics reflect the gateway-facing model alias instead of the backend's
+	// internal model path (e.g. TEI returns "/models/bge-m3").
+	if isEmbeddingPath(path) {
+		log.Infof("[%s] detected embedding request: %s", pluginName, path)
+		ctx.SetContext(ctxKeyIsEmbedding, true)
+		return types.ActionContinue
+	}
+
+	// Other paths: only need request body processing (stream usage injection)
 	ctx.DontReadResponseBody()
 
 	if !isPathEnabled(path, config.EnablePathSuffixes) {
@@ -134,6 +146,13 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 		return types.ActionContinue
 	}
 
+	// For embedding requests, save model name so we can overwrite the response model field
+	if ctx.GetBoolContext(ctxKeyIsEmbedding, false) {
+		ctx.SetContext(ctxKeyEmbeddingModel, modelName)
+		log.Infof("[%s] embedding request model: %s", pluginName, modelName)
+		return types.ActionContinue
+	}
+
 	// Check whitelist first (exact match) - skip if matched
 	if isInWhitelist(modelName, config.ModelWhitelist) {
 		log.Debugf("[%s] model %s in whitelist, skipping", pluginName, modelName)
@@ -152,31 +171,48 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 }
 
 // onHttpResponseHeaders handles the response headers phase.
-// Only processes rerank responses — non-rerank paths already called DontReadResponseBody in request headers.
+// Processes rerank and embedding responses — other paths already called DontReadResponseBody in request headers.
 func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig, log log.Log) types.Action {
-	if !ctx.GetBoolContext(ctxKeyIsRerank, false) {
+	if ctx.GetBoolContext(ctxKeyIsRerank, false) {
+		// Read x-compute-tokens header and save to context (cannot read response headers in body phase)
+		if tokenHeader, err := proxywasm.GetHttpResponseHeader(headerComputeTokens); err == nil && tokenHeader != "" {
+			if v, err := strconv.Atoi(tokenHeader); err == nil {
+				ctx.SetContext(ctxKeyComputeTokens, v)
+				log.Infof("[%s] got %s: %d", pluginName, headerComputeTokens, v)
+			}
+		}
+		// Remove content-length since we'll modify the body
+		proxywasm.RemoveHttpResponseHeader("content-length")
 		return types.ActionContinue
 	}
-	// Read x-compute-tokens header and save to context (cannot read response headers in body phase)
-	if tokenHeader, err := proxywasm.GetHttpResponseHeader(headerComputeTokens); err == nil && tokenHeader != "" {
-		if v, err := strconv.Atoi(tokenHeader); err == nil {
-			ctx.SetContext(ctxKeyComputeTokens, v)
-			log.Infof("[%s] got %s: %d", pluginName, headerComputeTokens, v)
-		}
+
+	if ctx.GetBoolContext(ctxKeyIsEmbedding, false) {
+		// We will overwrite the response body's model field, so the byte length will likely change.
+		proxywasm.RemoveHttpResponseHeader("content-length")
+		return types.ActionContinue
 	}
-	// Remove content-length since we'll modify the body
-	proxywasm.RemoveHttpResponseHeader("content-length")
+
 	return types.ActionContinue
 }
 
 // onHttpStreamingResponseBody handles the streaming response body phase.
 // For rerank requests, it wraps the raw array response with usage info from TEI headers.
+// For embedding requests, it overwrites the response body's model field with the request-side model
+// so downstream metrics (ai-statistics) reflect the gateway alias rather than the backend's internal path.
 // Using streaming mode ensures the modified body is visible to downstream plugins (ai-statistics, ai-quota-apikey).
 func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data []byte, endOfStream bool, log log.Log) []byte {
-	if !ctx.GetBoolContext(ctxKeyIsRerank, false) {
-		return data
+	if ctx.GetBoolContext(ctxKeyIsRerank, false) {
+		return processRerankStreamingBody(ctx, data, endOfStream, log)
 	}
+	if ctx.GetBoolContext(ctxKeyIsEmbedding, false) {
+		return processEmbeddingStreamingBody(ctx, data, endOfStream, log)
+	}
+	return data
+}
 
+// processRerankStreamingBody buffers the rerank response and, on endOfStream, transforms TEI's raw
+// array body into the standard rerank response object with model and usage fields populated.
+func processRerankStreamingBody(ctx wrapper.HttpContext, data []byte, endOfStream bool, log log.Log) []byte {
 	// For non-streaming rerank responses, buffer chunks until endOfStream
 	if !endOfStream {
 		buf, _ := ctx.GetContext(ctxKeyRerankBuffer).([]byte)
@@ -215,6 +251,44 @@ func onHttpStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, d
 	// TEI raw array response: [{"index":0,"score":0.99}, ...]
 	// Transform to standard format with usage info from x-compute-tokens header
 	return buildRerankResponseWithUsage(body, modelName, computeTokens)
+}
+
+// processEmbeddingStreamingBody buffers the embedding response and, on endOfStream, replaces the
+// response body's model field with the request-side model. The backend (e.g. TEI) often returns its
+// own internal path like "/models/bge-m3" which would otherwise leak into downstream metrics.
+func processEmbeddingStreamingBody(ctx wrapper.HttpContext, data []byte, endOfStream bool, log log.Log) []byte {
+	if !endOfStream {
+		buf, _ := ctx.GetContext(ctxKeyEmbeddingBuffer).([]byte)
+		buf = append(buf, data...)
+		ctx.SetContext(ctxKeyEmbeddingBuffer, buf)
+		return nil
+	}
+
+	body := data
+	if buf, ok := ctx.GetContext(ctxKeyEmbeddingBuffer).([]byte); ok && len(buf) > 0 {
+		body = append(buf, data...)
+	}
+
+	modelName := ""
+	if v := ctx.GetContext(ctxKeyEmbeddingModel); v != nil {
+		modelName = v.(string)
+	}
+	if modelName == "" {
+		return body
+	}
+
+	current := gjson.GetBytes(body, fieldModel).String()
+	if current == modelName {
+		return body
+	}
+
+	rewritten, err := sjson.SetBytes(body, fieldModel, modelName)
+	if err != nil {
+		log.Errorf("[%s] failed to rewrite embedding model field: %v", pluginName, err)
+		return body
+	}
+	log.Infof("[%s] embedding response model rewritten: %q -> %q", pluginName, current, modelName)
+	return rewritten
 }
 
 // buildRerankResponseWithUsage wraps the TEI rerank array response into an object with usage info.
@@ -279,11 +353,21 @@ func isInBlacklist(modelName string, prefixes []string) bool {
 }
 
 // isRerankPath checks if the request path is a rerank endpoint.
+// Matches both "/rerank" and "/v1/rerank" (and any suffix-equivalent).
 func isRerankPath(path string) bool {
 	if idx := strings.Index(path, "?"); idx != -1 {
 		path = path[:idx]
 	}
 	return strings.HasSuffix(path, "/rerank")
+}
+
+// isEmbeddingPath checks if the request path is an embedding endpoint.
+// Matches "/embeddings" and "/v1/embeddings".
+func isEmbeddingPath(path string) bool {
+	if idx := strings.Index(path, "?"); idx != -1 {
+		path = path[:idx]
+	}
+	return strings.HasSuffix(path, "/embeddings")
 }
 
 // isPathEnabled checks if the request path matches any enabled suffix.
