@@ -3,7 +3,7 @@
 
 # Plugin configuration
 PLUGIN_NAME := ai-route-auth
-REGISTRY ?= quanzhenglong.com/camp/
+REGISTRY ?= quanzhenglong.com/camp/higress
 VERSION ?= latest
 IMG ?= ${REGISTRY}${PLUGIN_NAME}:${VERSION}
 

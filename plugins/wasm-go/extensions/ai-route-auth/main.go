@@ -87,6 +87,12 @@ type RouteAuthConfig struct {
 	// 允许访问的租户-项目列表（从 matchRules 中获取）
 	// 替代原 allowWorkspaces
 	allowWorkspaceProjects []WorkspaceProject
+
+	// ruleConfigured 表示该配置来自匹配到的 matchRule（而非 defaultConfig）。
+	// 用于区分两种 allowWorkspaceProjects 为空的情况：
+	//   - 未匹配到任何 matchRule（用的是 defaultConfig）   -> 跳过鉴权、放行
+	//   - 匹配到了 matchRule 但 allow 列表为空（配置异常）  -> 拒绝该路由
+	ruleConfigured bool
 }
 
 // ============================================================================
@@ -205,13 +211,18 @@ func parseRuleConfig(json gjson.Result, global RouteAuthConfig, config *RouteAut
 	// 继承全局配置
 	*config = global
 
-	// Parse allow_workspace_projects (required in matchRules)
-	allowWPJson := json.Get("allow_workspace_projects")
-	if !allowWPJson.Exists() {
-		return errors.New("allow_workspace_projects is required in matchRules config")
-	}
+	// 标记该配置来自匹配到的 matchRule，用于在请求处理时区分
+	// 「未匹配到 matchRule（放行）」与「匹配到但 allow 列表为空（拒绝）」。
+	config.ruleConfigured = true
 
+	// Parse allow_workspace_projects
+	// 注意：这里【不再】因为字段缺失或为空而返回 error。
+	// wrapper.ParseOverrideConfigBy 下，任意一条 matchRule 解析失败都会导致整个插件
+	// 配置加载失败；配合 failStrategy=FAIL_CLOSE，会使网关上【所有】路由全部返回 403。
+	// 空列表是一个合法语义：表示该路由不允许任何 API Key 访问（deny all），
+	// 这一拒绝逻辑在 onHttpRequestHeaders 中处理，而不是在解析阶段报错。
 	config.allowWorkspaceProjects = make([]WorkspaceProject, 0)
+	allowWPJson := json.Get("allow_workspace_projects")
 	if allowWPJson.IsArray() {
 		for _, item := range allowWPJson.Array() {
 			wp := parseWorkspaceProjectString(item.String())
@@ -222,10 +233,10 @@ func parseRuleConfig(json gjson.Result, global RouteAuthConfig, config *RouteAut
 	}
 
 	if len(config.allowWorkspaceProjects) == 0 {
-		return errors.New("allow_workspace_projects cannot be empty")
+		log.Warnf("allow_workspace_projects is empty; this route will deny all API keys")
+	} else {
+		log.Debugf("loaded allow_workspace_projects: %v", config.allowWorkspaceProjects)
 	}
-
-	log.Debugf("loaded allow_workspace_projects: %v", config.allowWorkspaceProjects)
 
 	// rule_name 字段仅作为配置标识，插件逻辑中不需要使用
 
@@ -250,12 +261,19 @@ func parseWorkspaceProjectString(s string) *WorkspaceProject {
 
 // onHttpRequestHeaders 处理 HTTP 请求头，进行路由权限验证
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config RouteAuthConfig, log log.Log) types.Action {
-	// Step 1: 检查是否有 allow_workspace_projects 配置
-	// 如果没有匹配的 matchRules，config 会是 defaultConfig，其中没有 allow_workspace_projects
-	// 这种情况下跳过处理（因为只有 matchRules 中才有 allow_workspace_projects）
-	if len(config.allowWorkspaceProjects) == 0 {
-		log.Debugf("no allow_workspace_projects configured, skipping")
+	// Step 1: 未匹配到任何 matchRule（用的是 defaultConfig，没有 allow_workspace_projects）
+	// 这种情况下跳过处理，放行（鉴权只在 matchRules 命中的路由上生效）。
+	if !config.ruleConfigured {
+		log.Debugf("no matched rule, skipping")
 		return types.ActionContinue
+	}
+
+	// Step 1.1: 命中了 matchRule，但 allow_workspace_projects 为空。
+	// 语义为「该路由不允许任何 API Key 访问」(deny all)，直接拒绝。
+	// 这里不能放行，否则空配置会变成「对所有人开放」，与预期相反。
+	if len(config.allowWorkspaceProjects) == 0 {
+		log.Warnf("allow_workspace_projects is empty, deny all access to this route")
+		return deniedInvalidAPIKey()
 	}
 
 	// Step 1.5: 如果 user_apikeys 未配置，则不进行鉴权
