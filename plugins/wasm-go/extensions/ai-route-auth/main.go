@@ -88,6 +88,11 @@ type RouteAuthConfig struct {
 	// 替代原 allowWorkspaces
 	allowWorkspaceProjects []WorkspaceProject
 
+	// 本路由（=模型）直接授权的 apikey 集合（从 matchRules 中获取）
+	// 独立于 workspace/project 的放行通道：命中即放行。
+	// 用 set 便于 O(1) 命中查找。
+	allowApiKeys map[string]struct{}
+
 	// ruleConfigured 表示该配置来自匹配到的 matchRule（而非 defaultConfig）。
 	// 用于区分两种 allowWorkspaceProjects 为空的情况：
 	//   - 未匹配到任何 matchRule（用的是 defaultConfig）   -> 跳过鉴权、放行
@@ -205,7 +210,8 @@ func parseConfig(json gjson.Result, config *RouteAuthConfig, log log.Log) error 
 //
 //	{
 //	  "rule_name": "infer-357cefd0-c54d-4d8b-9637-2beb7006c0e4",
-//	  "allow_workspace_projects": ["*:*", "tenant1:*", "tenant1:project-a,project-b"]
+//	  "allow_workspace_projects": ["*:*", "tenant1:*", "tenant1:project-a,project-b"],
+//	  "allow_apikeys": ["sk-aaa", "sk-ccc"]
 //	}
 func parseRuleConfig(json gjson.Result, global RouteAuthConfig, config *RouteAuthConfig, log log.Log) error {
 	// 继承全局配置
@@ -238,6 +244,25 @@ func parseRuleConfig(json gjson.Result, global RouteAuthConfig, config *RouteAut
 		log.Debugf("loaded allow_workspace_projects: %v", config.allowWorkspaceProjects)
 	}
 
+	// Parse allow_apikeys
+	// 本路由（=模型）直接授权的 apikey 列表，独立于 workspace/project 的放行通道。
+	// 与 allow_workspace_projects 一样，空值是合法语义（仅表示该路由不通过 apikey
+	// 维度授权），不在解析阶段报错。
+	config.allowApiKeys = make(map[string]struct{})
+	allowApiKeysJson := json.Get("allow_apikeys")
+	if allowApiKeysJson.IsArray() {
+		for _, item := range allowApiKeysJson.Array() {
+			key := item.String()
+			if key != "" {
+				config.allowApiKeys[key] = struct{}{}
+			}
+		}
+	}
+
+	if len(config.allowApiKeys) > 0 {
+		log.Debugf("loaded %d directly-authorized apikeys for this route", len(config.allowApiKeys))
+	}
+
 	// rule_name 字段仅作为配置标识，插件逻辑中不需要使用
 
 	return nil
@@ -268,11 +293,12 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config RouteAuthConfig, log l
 		return types.ActionContinue
 	}
 
-	// Step 1.1: 命中了 matchRule，但 allow_workspace_projects 为空。
-	// 语义为「该路由不允许任何 API Key 访问」(deny all)，直接拒绝。
+	// Step 1.1: 命中了 matchRule，但两个授权维度（allow_workspace_projects 与
+	// allow_apikeys）都为空。语义为「该路由不允许任何 API Key 访问」(deny all)，直接拒绝。
 	// 这里不能放行，否则空配置会变成「对所有人开放」，与预期相反。
-	if len(config.allowWorkspaceProjects) == 0 {
-		log.Warnf("allow_workspace_projects is empty, deny all access to this route")
+	// 注意：只要任一维度非空就不该 deny all，否则只配 allow_apikeys 的路由会被误拒。
+	if len(config.allowWorkspaceProjects) == 0 && len(config.allowApiKeys) == 0 {
+		log.Warnf("both allow_workspace_projects and allow_apikeys are empty, deny all access to this route")
 		return deniedInvalidAPIKey()
 	}
 
@@ -311,6 +337,14 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config RouteAuthConfig, log l
 	_ = proxywasm.ReplaceHttpRequestHeader("x-api-key-name", consumerValue)
 	_ = proxywasm.ReplaceHttpRequestHeader("x-mse-consumer", consumerValue)
 	log.Debugf("set consumer header: user=%s", userName)
+
+	// Step 4.5: 模型（=路由）级 apikey 授权：独立优先放行通道。
+	// 只要该 apikey 出现在本路由的 allow_apikeys 中，即放行，不再要求 project 匹配。
+	// 未命中则回落到 Step 5 的 workspace/project 校验，整体为 OR 语义。
+	if _, granted := config.allowApiKeys[apiKey]; granted {
+		log.Infof("auth success: user=%s (apikey directly granted on this route)", userName)
+		return types.ActionContinue
+	}
 
 	// Step 5: 权限验证（三级鉴权）
 	for _, wp := range config.allowWorkspaceProjects {

@@ -11,7 +11,7 @@ metadata:
     higress.io/wasm-plugin-built-in: "false"
     higress.io/wasm-plugin-category: custom
     higress.io/wasm-plugin-name: ai-route-auth
-    higress.io/wasm-plugin-version: 0.0.7
+    higress.io/wasm-plugin-version: 0.0.8
 spec:
   defaultConfig:
     # ========================================
@@ -90,6 +90,9 @@ spec:
     #       - "*:*" 表示所有人都可以访问（公开模式）
     #       - "tenant1:*" 表示 tenant1 下所有用户都可以访问
     #       - "tenant1:project-a,project-b" 表示只有指定项目的用户才能访问
+    #     - allow_apikeys: 直接授权到本路由(=模型)的 apikey 列表（可选）
+    #       独立优先放行通道，命中即放行，不要求该 apikey 对应用户属于上面的项目。
+    #       与 allow_workspace_projects 为 OR 语义；两者都为空则该路由 deny all。
     #   - ingress: 匹配的 ingress 路由名称列表
 
     # 示例1：公开模式（所有 API Key 用户都可以访问）
@@ -125,4 +128,4 @@ spec:
   # For local testing, use file:// URL
   # url: file:///opt/plugins/wasm-go/extensions/ai-route-auth/plugin.wasm
   # For production, use OCI registry
-  url: oci://quanzhenglong.com/camp/higress/ai-route-auth:v0.0.7
+  url: oci://quanzhenglong.com/camp/higress/ai-route-auth:v0.0.8
