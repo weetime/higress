@@ -1,0 +1,29 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: mcp-server-auth.rise.io
+  namespace: higress-system
+  annotations:
+    higress.io/wasm-plugin-description: MCP Server 请求头鉴权（Authorization Bearer）
+    higress.io/wasm-plugin-title: mcp-server-auth
+  labels:
+    higress.io/resource-definer: higress
+    higress.io/wasm-plugin-built-in: "false"
+    higress.io/wasm-plugin-category: custom
+    higress.io/wasm-plugin-name: mcp-server-auth
+    higress.io/wasm-plugin-version: 0.0.4
+spec:
+  defaultConfig:
+    keys:
+      - Authorization
+      - ak
+  defaultConfigDisable: false
+  matchRules:
+    - config:
+        allow:
+          - ak-123
+      configDisable: false
+      ingress:
+        - mcp-server-test-prometheus.internal
+  url: oci://quanzhenglong.com/camp/higress/mcp-server-auth:v0.0.4
+  imagePullPolicy: Always
