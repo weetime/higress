@@ -375,8 +375,9 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config RouteAuthConfig, log l
 	}
 
 	// 用户不在任何允许的租户/项目中
+	// 统一对外文案：不暴露 user 是否存在等内部信息，与 key 未授权的情况返回同样的响应。
 	log.Warnf("user %q not authorized to access this route", userName)
-	return deniedAccessDenied(userName)
+	return deniedInvalidAPIKey()
 }
 
 // ============================================================================
@@ -467,29 +468,10 @@ func deniedInvalidAPIKey() types.Action {
 	return types.ActionContinue
 }
 
-// deniedAccessDenied 当用户无权访问路由时返回 403
-func deniedAccessDenied(userName string) types.Action {
-	_ = proxywasm.SendHttpResponseWithDetail(
-		http.StatusForbidden,
-		pluginName+".access_denied",
-		responseHeaders(),
-		[]byte(fmt.Sprintf(`{"error":"User %s is not authorized to access this route"}`, userName)),
-		-1,
-	)
-	return types.ActionContinue
-}
-
 // wwwAuthenticateHeader 返回 401 响应的 WWW-Authenticate 头
 func wwwAuthenticateHeader(realm string) [][2]string {
 	return [][2]string{
 		{"Content-Type", "application/json"},
 		{"WWW-Authenticate", fmt.Sprintf("Bearer realm=%s", realm)},
-	}
-}
-
-// responseHeaders 返回标准 JSON 响应头
-func responseHeaders() [][2]string {
-	return [][2]string{
-		{"Content-Type", "application/json"},
 	}
 }
