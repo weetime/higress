@@ -41,10 +41,15 @@ type JsonRpcRequestFilterF func(context wrapper.HttpContext, config any, id util
 
 type JsonRpcResponseFilterF func(context wrapper.HttpContext, config any, id utils.JsonRpcID, result, error gjson.Result, rawBody []byte) types.Action
 
+// RequestHeadersFilterF 在请求头阶段回调（早于读 body）。此阶段修改请求头能可靠向后续 filter 传播，
+// 用于需要在读 body 前、仅凭请求头就决定并注入下游头的场景（如按 api-key 注入 x-envoy-allow-mcp-tools）。
+type RequestHeadersFilterF func(context wrapper.HttpContext, config any) types.Action
+
 type Context struct {
 	filterName                    string
 	httpRequestFilter             HTTPFilterF
 	httpResponseFilter            HTTPFilterF
+	requestHeadersFilter          RequestHeadersFilterF
 	jsonRpcRequestFilter          JsonRpcRequestFilterF
 	jsonRpcResponseFilter         JsonRpcResponseFilterF
 	toolCallRequestFilter         ToolCallRequestFilterF
@@ -97,6 +102,19 @@ func FilterName(name string) CtxOption {
 
 func (o *filterNameOption) Apply(ctx *Context) {
 	ctx.filterName = o.name
+}
+
+type setRequestHeadersFilterOption struct {
+	f RequestHeadersFilterF
+}
+
+// SetRequestHeadersFilter 注册请求头阶段回调（可选）。默认不设=无此阶段处理。
+func SetRequestHeadersFilter(f RequestHeadersFilterF) CtxOption {
+	return &setRequestHeadersFilterOption{f}
+}
+
+func (o *setRequestHeadersFilterOption) Apply(ctx *Context) {
+	ctx.requestHeadersFilter = o.f
 }
 
 type setJsonRpcRequestFilterOption struct {
@@ -217,6 +235,7 @@ type mcpFilterConfig struct {
 	config                 any
 	httpRequestHandler     HTTPFilterF
 	httpResponseHandler    HTTPFilterF
+	requestHeadersHandler  func(ctx wrapper.HttpContext) types.Action
 	jsonRpcRequestHandler  utils.JsonRpcRequestHandler
 	jsonRpcResponseHandler utils.JsonRpcResponseHandler
 }
@@ -225,6 +244,11 @@ func installHandler(config *mcpFilterConfig) {
 	config.httpRequestHandler = globalContext.httpRequestFilter
 	config.httpResponseHandler = globalContext.httpResponseFilter
 	bizConfig := config.config
+	if globalContext.requestHeadersFilter != nil {
+		config.requestHeadersHandler = func(ctx wrapper.HttpContext) types.Action {
+			return globalContext.requestHeadersFilter(ctx, bizConfig)
+		}
+	}
 	if globalContext.jsonRpcRequestFilter != nil || globalContext.toolCallRequestFilter != nil {
 		config.jsonRpcRequestHandler = func(context wrapper.HttpContext, id utils.JsonRpcID, method string, params gjson.Result, rawBody []byte) types.Action {
 			if globalContext.jsonRpcRequestFilter != nil {
@@ -291,6 +315,12 @@ func parseOverrideConfig(configBytes []byte, global mcpFilterConfig, config *mcp
 
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config mcpFilterConfig) types.Action {
 	log.Debugf("onHttpRequestHeaders called")
+	// 请求头阶段回调：此阶段改请求头可靠向后传播（body 阶段改的头往往传不到后续 filter）。
+	if config.requestHeadersHandler != nil {
+		if action := config.requestHeadersHandler(ctx); action != types.ActionContinue {
+			return action
+		}
+	}
 	if !ctx.HasRequestBody() || (config.httpRequestHandler == nil && config.jsonRpcRequestHandler == nil) {
 		log.Debugf("no request body or no handler, skip reading body")
 		ctx.DontReadRequestBody()

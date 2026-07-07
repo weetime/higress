@@ -68,6 +68,8 @@ var (
 
 	FilterName = filter.FilterName
 
+	SetRequestHeadersFilter = filter.SetRequestHeadersFilter
+
 	SetJsonRpcRequestFilter = filter.SetJsonRpcRequestFilter
 
 	SetJsonRpcResponseFilter = filter.SetJsonRpcResponseFilter
