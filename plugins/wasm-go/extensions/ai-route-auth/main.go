@@ -15,7 +15,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -81,7 +80,9 @@ type RouteAuthConfig struct {
 	// 从 user_apikeys 转换而来，用于快速查找
 	apiKeyMapping map[string]string
 
-	// 认证头名称，默认 "Authorization"
+	// 认证头名称。可选，用于强制指定唯一的凭证来源 header。
+	// 不配置（或配为默认 "Authorization"）时，插件按优先级自动兼容
+	// OpenAI(Authorization: Bearer) 与 Anthropic(x-api-key) 等多种协议。
 	authHeaderName string
 
 	// 允许访问的租户-项目列表（从 matchRules 中获取）
@@ -308,17 +309,11 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config RouteAuthConfig, log l
 		return types.ActionContinue
 	}
 
-	// Step 2: 提取 API Key
-	authHeader, err := proxywasm.GetHttpRequestHeader(config.authHeaderName)
-	if err != nil || authHeader == "" {
-		log.Warnf("auth header %q is missing", config.authHeaderName)
+	// Step 2: 提取 API Key（兼容 OpenAI 的 Authorization 与 Anthropic 的 x-api-key）
+	apiKey, found := extractCredential(config.authHeaderName)
+	if !found {
+		log.Warnf("no credential found in any supported auth header")
 		return deniedMissingAuthHeader(config.authHeaderName)
-	}
-
-	apiKey, err := extractAPIKey(authHeader, config.authHeaderName)
-	if err != nil {
-		log.Warnf("invalid auth format: %v", err)
-		return deniedInvalidAuthFormat(config.authHeaderName)
 	}
 
 	// Step 3: 查找用户
@@ -384,28 +379,62 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config RouteAuthConfig, log l
 // Helper Functions
 // ============================================================================
 
-// extractAPIKey 从认证头中提取 API Key
-// 对于 "Authorization" header，期望 "Bearer <token>" 格式
-// 对于其他 header，直接使用值
-func extractAPIKey(headerValue, headerName string) (string, error) {
-	if headerName == defaultAuthHeaderName {
-		// Authorization header: 期望 "Bearer <token>" 格式
-		if !strings.HasPrefix(headerValue, bearerPrefix) {
-			return "", errors.New("bearer token not found")
+// anthropicStyleAuthHeaders 定义在未显式配置 auth_header_name 时，按优先级依次
+// 检查的 Anthropic / 透传风格认证 header。顺序与主流 ai-proxy 保持一致。
+var anthropicStyleAuthHeaders = []string{"x-api-key", "x-authorization", "anthropic-api-key"}
+
+// extractCredential 从请求头中按优先级提取原始 API Key，兼容 OpenAI 与 Anthropic 两种协议：
+//   - OpenAI:    Authorization: Bearer <key>
+//   - Anthropic: x-api-key: <key>
+//
+// 优先级（与主流 ai-proxy provider 的默认行为一致）：
+//  1. 显式配置的 auth_header_name（非默认值时）——运维可强制指定唯一来源
+//  2. x-api-key / x-authorization / anthropic-api-key（Anthropic / 透传风格）
+//  3. Authorization: Bearer <key>（OpenAI 风格；无 Bearer 前缀时按原值处理）
+//
+// 返回 (apiKey, found)。found=false 表示所有候选 header 均缺失或为空。
+func extractCredential(configuredHeader string) (string, bool) {
+	// 1. 显式配置优先：仅当运维把 auth_header_name 配成非默认值时生效。
+	//    此时按该 header 直取原值（不做 Bearer 解析），语义与旧行为保持一致。
+	if configuredHeader != "" && !strings.EqualFold(configuredHeader, defaultAuthHeaderName) {
+		if v, err := proxywasm.GetHttpRequestHeader(configuredHeader); err == nil {
+			if key := strings.TrimSpace(v); key != "" {
+				return key, true
+			}
 		}
-		apiKey := strings.TrimSpace(headerValue[len(bearerPrefix):])
-		if apiKey == "" {
-			return "", errors.New("empty bearer token")
-		}
-		return apiKey, nil
 	}
 
-	// 其他 header: 直接使用值
-	apiKey := strings.TrimSpace(headerValue)
-	if apiKey == "" {
-		return "", errors.New("empty header value")
+	// 2. Anthropic / 透传风格 header
+	for _, h := range anthropicStyleAuthHeaders {
+		if v, err := proxywasm.GetHttpRequestHeader(h); err == nil {
+			if key := strings.TrimSpace(v); key != "" {
+				return key, true
+			}
+		}
 	}
-	return apiKey, nil
+
+	// 3. OpenAI 风格 Authorization: Bearer <key>
+	if v, err := proxywasm.GetHttpRequestHeader(defaultAuthHeaderName); err == nil {
+		if key := extractBearerToken(v); key != "" {
+			return key, true
+		}
+	}
+
+	return "", false
+}
+
+// extractBearerToken 从 Authorization 头中提取 token。
+// 兼容 "Bearer <token>" 与直接给出 token 两种写法（与主流 ai-proxy 一致）。
+func extractBearerToken(headerValue string) string {
+	headerValue = strings.TrimSpace(headerValue)
+	if headerValue == "" {
+		return ""
+	}
+	if len(headerValue) >= len(bearerPrefix) &&
+		strings.EqualFold(headerValue[:len(bearerPrefix)], bearerPrefix) {
+		return strings.TrimSpace(headerValue[len(bearerPrefix):])
+	}
+	return headerValue
 }
 
 // contains 检查切片中是否包含指定项
@@ -439,18 +468,6 @@ func deniedMissingAuthHeader(headerName string) types.Action {
 		pluginName+".missing_auth_header",
 		wwwAuthenticateHeader(protectionSpace),
 		[]byte(fmt.Sprintf(`{"error":"%s header is required"}`, headerName)),
-		-1,
-	)
-	return types.ActionContinue
-}
-
-// deniedInvalidAuthFormat 当认证头格式无效时返回 401
-func deniedInvalidAuthFormat(headerName string) types.Action {
-	_ = proxywasm.SendHttpResponseWithDetail(
-		http.StatusUnauthorized,
-		pluginName+".invalid_auth_format",
-		wwwAuthenticateHeader(protectionSpace),
-		[]byte(fmt.Sprintf(`{"error":"Invalid %s header format"}`, headerName)),
 		-1,
 	)
 	return types.ActionContinue
