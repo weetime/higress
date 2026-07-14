@@ -139,6 +139,17 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 
 	modelName := gjson.GetBytes(body, fieldModel).String()
 
+	// 暴露原始(改写前)模型名给下游观测链路。
+	// ai-route 在更晚阶段按 modelMapping 改写 request body 的 model 字段,ai-statistics
+	// 采到的就是改写后的上游名(如 gpt-5.4),CH 里也只有这个值。这里在 body 阶段(改写前)
+	// 把用户原始输入塞进 request header,Envoy access log 通过 %REQ(x-rise-user-model)%
+	// 抓出来,fluent-bit 写进 CH 列 user_facing_model,模型总览各页才能按"用户调用名"聚合。
+	if modelName != "" {
+		if err := proxywasm.AddHttpRequestHeader("x-rise-user-model", modelName); err != nil {
+			log.Warnf("[%s] failed to set x-rise-user-model header: %v", pluginName, err)
+		}
+	}
+
 	// For rerank requests, save model name for response processing
 	if ctx.GetBoolContext(ctxKeyIsRerank, false) {
 		ctx.SetContext(ctxKeyRerankModel, modelName)
