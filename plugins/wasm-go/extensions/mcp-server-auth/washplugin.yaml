@@ -1,0 +1,78 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: mcp-server-auth.rise.io
+  namespace: higress-system
+  annotations:
+    higress.io/wasm-plugin-description: MCP Server 多维度授权（用户分组 / api-key / tools 分组）
+    higress.io/wasm-plugin-title: mcp-server-auth
+  labels:
+    higress.io/resource-definer: higress
+    higress.io/wasm-plugin-built-in: "false"
+    higress.io/wasm-plugin-category: custom
+    higress.io/wasm-plugin-name: mcp-server-auth
+    higress.io/wasm-plugin-version: 0.0.12
+spec:
+  # defaultConfigDisable: true 时 Higress 不把 defaultConfig 传给插件（规则解析拿到的
+  # globalConfig 为 nil）。因此本插件把【完整配置】（身份/工具字典 + 授权 grants）直接写在
+  # 每条 matchRules 的 config 里，不依赖 defaultConfig 继承。
+  defaultConfigDisable: true
+  matchRules:
+    # 路由级完整配置：身份与工具字典 + 授权（主体 -> 工具集，OR 语义）
+    - config:
+        # token 来源请求头
+        keys:
+          - Authorization
+        # user -> [apikey]（内部反转为 apikey -> user）
+        user_apikeys:
+          admin: ["sk-aaa", "ak-bbb"]
+          alice: ["sk-ccc"]
+        # group -> [user]（内部反转为 user -> [group]）
+        group_users:
+          ops: ["admin"]
+          readers: ["admin", "alice"]
+        # 工具集 -> [tool]（工具名必须与 MCP server 真实 tools/list 返回的 name 一致，
+        # 否则非 "*" 的授权会因匹配不到工具而把列表全过滤空。此处为 Prometheus MCP server）
+        tool_groups:
+          # 只读查询类
+          read-tools:
+            - prometheus_query
+            - prometheus_query_range
+            - prometheus_list_metrics
+            - prometheus_label_names
+            - prometheus_label_values
+            - prometheus_series
+            - prometheus_metric_metadata
+          # 运维/集群自省类
+          admin-tools:
+            - prometheus_alerts
+            - prometheus_rules
+            - prometheus_targets
+            - prometheus_runtime_info
+            - prometheus_build_info
+            - prometheus_tsdb_status
+        # 授权（主体 -> 工具集，命中任一即放行）
+        grants:
+          - apikey: sk-be60bd9b-1995-42fd-b640-50b3a56ebf1b
+            tool_groups:
+            - admin-tools
+          - apikey: sk-mcp-tools-discovery
+            list_only: true
+            tool_groups:
+            - '*'
+        # 向后兼容：旧 allow 列表仍可用，等价于把这些 apikey 直授全部工具
+        # allow:
+        #   - ak-123
+        user_apikeys:
+          admin:
+          - sk-be60bd9b-1995-42fd-b640-50b3a56ebf1b
+      configDisable: false
+      ingress:
+        - mcp-server-camp.internal
+  # 必须早于 mcp-server 托管插件（UNSPECIFIED_PHASE）执行：AUTHN 阶段保证 auth 先读 body 做鉴权、
+  # 先在请求头阶段注入 x-envoy-allow-mcp-tools，host 随后才能读到并按授权过滤 tools/list。
+  # 缺了 phase 时本插件默认落在 UNSPECIFIED_PHASE，与 host 同阶段、顺序不定 → 排在 host 后面则鉴权/过滤全失效。
+  phase: AUTHN
+  priority: 320
+  url: oci://quanzhenglong.com/camp/higress/mcp-server-auth:v0.0.12
+  imagePullPolicy: Always
