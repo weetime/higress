@@ -274,7 +274,8 @@ func onJsonRpcRequest(ctx wrapper.HttpContext, cfg any, id utils.JsonRpcID, meth
 
 	ctx.SetContext(ctxAllowedListGroups, listGroups)
 	ctx.SetContext(ctxAllowedCallGroups, callGroups)
-	_ = proxywasm.ReplaceHttpRequestHeader("x-mse-consumer", consumer)
+	// 门禁通过后再确认一次身份头（onRequestHeaders 已注入过，这里覆盖为门禁后的权威值）。
+	applyConsumerHeaders(consumer)
 	// 注：x-envoy-allow-mcp-tools 的注入已移到 onRequestHeaders（请求头阶段）——body 阶段改请求头传不到
 	// 后续 mcp-server host，headers 阶段才可靠。这里不再设。
 
@@ -282,21 +283,54 @@ func onJsonRpcRequest(ctx wrapper.HttpContext, cfg any, id utils.JsonRpcID, meth
 	return types.ActionContinue
 }
 
-// onRequestHeaders 请求头阶段：仅凭 api-key（Authorization 头此阶段已可读）解析调用者可见工具集，
-// 写入 x-envoy-allow-mcp-tools，供 mcp-server 托管插件在生成 tools/list 时自过滤（OPEN_API 场景生效）。
+// onRequestHeaders 请求头阶段：仅凭 api-key（Authorization 头此阶段已可读）解析调用者身份与可见工具集，
+// 注入两类请求头：
+//   - x-envoy-allow-mcp-tools：供 mcp-server 托管插件在生成 tools/list 时自过滤（OPEN_API 场景生效）。
+//   - x-mse-consumer / x-api-key-name：调用方身份，与 ai-route-auth 一致（见 ai-route-auth/main.go
+//     Step 4）。必须在请求头阶段注入——cluster-key-rate-limit 等插件只挂 ProcessRequestHeaders，
+//     读不到 body 阶段（onJsonRpcRequest）才写的头，否则按调用方限流永远命中不了。
+//
 // 不在此拒绝——身份门禁仍由 onJsonRpcRequest 在 body 阶段处理（能发规范的 JSON-RPC 错误）。
 func onRequestHeaders(ctx wrapper.HttpContext, cfg any) types.Action {
 	config, ok := cfg.(McpAuthConfig)
 	if !ok || len(config.grants) == 0 {
+		// 本路由不鉴权（或配置异常）：身份无从确认，清掉客户端自带的身份头，避免下游误信。
+		clearConsumerHeaders()
 		return types.ActionContinue
 	}
 	// 只算不拒：computeGroups 无副作用，不发任何响应。拒绝仍由 body 阶段 onJsonRpcRequest 处理。
-	listGroups, _, _, st, matched := computeGroups(config)
+	listGroups, _, consumer, st, matched := computeGroups(config)
 	if st != tokenOK || !matched {
+		clearConsumerHeaders()
 		return types.ActionContinue
 	}
+	applyConsumerHeaders(consumer)
 	applyToolListAllowHeader(config, listGroups)
 	return types.ActionContinue
+}
+
+// consumerHeaders 是本插件注入的下游身份头。
+// x-mse-consumer 是 higress 的通用 consumer 约定（cluster-key-rate-limit 的 limit_by_consumer /
+// limit_by_per_consumer 固定读它）；x-api-key-name 与 ai-route-auth 对齐，让 AI 路由与 MCP 两条链路
+// 能共用同一份限流配置。两者取值相同，均为 buildConsumer 的 "user/apikey后8位"。
+var consumerHeaders = []string{"x-mse-consumer", "x-api-key-name"}
+
+// applyConsumerHeaders 注入调用方身份。
+func applyConsumerHeaders(consumer string) {
+	for _, h := range consumerHeaders {
+		_ = proxywasm.ReplaceHttpRequestHeader(h, consumer)
+	}
+}
+
+// clearConsumerHeaders 移除客户端自带的身份头。
+//
+// 必须清：请求头阶段只算不拒，身份没解析出来时请求仍会继续走到 body 阶段才被门禁拦下，
+// 而限流计数发生在请求头阶段——早于门禁。不清的话，任何人带一个伪造的 x-api-key-name
+// 就能把计数记到别人的桶上（烧掉受害者额度），或靠轮换该头绕开自己的限额。
+func clearConsumerHeaders() {
+	for _, h := range consumerHeaders {
+		_ = proxywasm.RemoveHttpRequestHeader(h)
+	}
 }
 
 // applyToolListAllowHeader 在请求阶段设置 x-envoy-allow-mcp-tools=调用者可见工具名(逗号分隔)，
@@ -337,7 +371,7 @@ func onFallbackHttpRequest(ctx wrapper.HttpContext, cfg any, headers [][2]string
 	if !passed {
 		return deny
 	}
-	_ = proxywasm.ReplaceHttpRequestHeader("x-mse-consumer", consumer)
+	applyConsumerHeaders(consumer)
 	log.Infof("mcp-server-auth: non-jsonrpc request authenticated, consumer=%s", consumer)
 	return types.ActionContinue
 }
