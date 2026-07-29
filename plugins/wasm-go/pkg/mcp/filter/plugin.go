@@ -31,6 +31,12 @@ const (
 
 type HTTPFilterF func(context wrapper.HttpContext, config any, headers [][2]string, body []byte) types.Action
 
+// RequestHeadersFilterF runs in the request-HEADERS phase, before any body is
+// buffered. Mutations made here (e.g. ReplaceHttpRequestHeader) are the only
+// ones that still reach the upstream mcp-server host filter — headers rewritten
+// in the body phase are already frozen from the host's point of view.
+type RequestHeadersFilterF func(context wrapper.HttpContext, config any) types.Action
+
 type ToolCallRequestFilterF func(context wrapper.HttpContext, config any, toolName string, toolArgs gjson.Result, rawBody []byte) types.Action
 
 type ToolCallResponseFilterF func(context wrapper.HttpContext, config any, isError bool, content gjson.Result, rawBody []byte) types.Action
@@ -43,6 +49,7 @@ type JsonRpcResponseFilterF func(context wrapper.HttpContext, config any, id uti
 
 type Context struct {
 	filterName                    string
+	requestHeadersFilter          RequestHeadersFilterF
 	httpRequestFilter             HTTPFilterF
 	httpResponseFilter            HTTPFilterF
 	jsonRpcRequestFilter          JsonRpcRequestFilterF
@@ -121,6 +128,18 @@ func SetJsonRpcResponseFilter(f JsonRpcResponseFilterF) CtxOption {
 
 func (o *setJsonRpcResponseFilterOption) Apply(ctx *Context) {
 	ctx.jsonRpcResponseFilter = o.f
+}
+
+type setRequestHeadersFilterOption struct {
+	f RequestHeadersFilterF
+}
+
+func SetRequestHeadersFilter(f RequestHeadersFilterF) CtxOption {
+	return &setRequestHeadersFilterOption{f}
+}
+
+func (o *setRequestHeadersFilterOption) Apply(ctx *Context) {
+	ctx.requestHeadersFilter = o.f
 }
 
 type setFallbackHTTPRequestFilterOption struct {
@@ -215,6 +234,7 @@ func Initialize() {
 
 type mcpFilterConfig struct {
 	config                 any
+	requestHeadersHandler  RequestHeadersFilterF
 	httpRequestHandler     HTTPFilterF
 	httpResponseHandler    HTTPFilterF
 	jsonRpcRequestHandler  utils.JsonRpcRequestHandler
@@ -222,6 +242,7 @@ type mcpFilterConfig struct {
 }
 
 func installHandler(config *mcpFilterConfig) {
+	config.requestHeadersHandler = globalContext.requestHeadersFilter
 	config.httpRequestHandler = globalContext.httpRequestFilter
 	config.httpResponseHandler = globalContext.httpResponseFilter
 	bizConfig := config.config
@@ -291,6 +312,14 @@ func parseOverrideConfig(configBytes []byte, global mcpFilterConfig, config *mcp
 
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config mcpFilterConfig) types.Action {
 	log.Debugf("onHttpRequestHeaders called")
+	// Run the headers-phase filter first, and let a non-Continue action short
+	// circuit before we decide whether to buffer the body.
+	if config.requestHeadersHandler != nil {
+		if ret := config.requestHeadersHandler(ctx, config.config); ret != types.ActionContinue {
+			ctx.DontReadRequestBody()
+			return ret
+		}
+	}
 	if !ctx.HasRequestBody() || (config.httpRequestHandler == nil && config.jsonRpcRequestHandler == nil) {
 		log.Debugf("no request body or no handler, skip reading body")
 		ctx.DontReadRequestBody()

@@ -72,6 +72,8 @@ var (
 
 	SetJsonRpcResponseFilter = filter.SetJsonRpcResponseFilter
 
+	SetRequestHeadersFilter = filter.SetRequestHeadersFilter
+
 	SetFallbackHTTPRequestFilter = filter.SetFallbackHTTPRequestFilter
 
 	SetFallbackHTTPResponseFilter = filter.SetFallbackHTTPResponseFilter
