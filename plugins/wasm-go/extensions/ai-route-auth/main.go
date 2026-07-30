@@ -239,9 +239,7 @@ func parseRuleConfig(json gjson.Result, global RouteAuthConfig, config *RouteAut
 		}
 	}
 
-	if len(config.allowWorkspaceProjects) == 0 {
-		log.Warnf("allow_workspace_projects is empty; this route will deny all API keys")
-	} else {
+	if len(config.allowWorkspaceProjects) > 0 {
 		log.Debugf("loaded allow_workspace_projects: %v", config.allowWorkspaceProjects)
 	}
 
@@ -262,6 +260,14 @@ func parseRuleConfig(json gjson.Result, global RouteAuthConfig, config *RouteAut
 
 	if len(config.allowApiKeys) > 0 {
 		log.Debugf("loaded %d directly-authorized apikeys for this route", len(config.allowApiKeys))
+	}
+
+	// 两个授权维度是 OR 语义，只有都为空才是 deny all（与 onHttpRequestHeaders Step 1.1 的
+	// 判断保持一致）。只看 allow_workspace_projects 会对「仅配 allow_apikeys」的路由误报，
+	// 而本函数在每次配置下发时对每条 matchRule、每个 VM 都要跑一遍，误报足以淹没网关日志。
+	if len(config.allowWorkspaceProjects) == 0 && len(config.allowApiKeys) == 0 {
+		log.Warnf("rule %q: both allow_workspace_projects and allow_apikeys are empty; this route will deny all API keys",
+			json.Get("rule_name").String())
 	}
 
 	// rule_name 字段仅作为配置标识，插件逻辑中不需要使用

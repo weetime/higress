@@ -11,7 +11,7 @@ metadata:
     higress.io/wasm-plugin-built-in: "false"
     higress.io/wasm-plugin-category: custom
     higress.io/wasm-plugin-name: model-analytics
-    higress.io/wasm-plugin-version: 0.0.7
+    higress.io/wasm-plugin-version: 0.0.9
 spec:
   defaultConfig:
     # ========================================
@@ -31,9 +31,12 @@ spec:
     # enable_path_suffixes: 启用的路径后缀列表
     # 只有匹配这些后缀的请求才会被插件处理（流式usage补充）
     # 注意: rerank路径(/rerank)自动启用，无需在此配置
-    # 默认值: ["/v1/chat/completions"]
+    # 默认值: ["/v1/chat/completions", "/v1/audio/speech", "/v1/audio/transcriptions", "/v1/images/generations"]
     enable_path_suffixes:
       - "/v1/chat/completions"
+      - "/v1/audio/speech"
+      - "/v1/audio/transcriptions"
+      - "/v1/images/generations"
 
   matchRules: []
   defaultConfigDisable: false
@@ -44,4 +47,4 @@ spec:
   # For local testing, use file:// URL
   # url: file:///opt/plugins/wasm-go/extensions/model-analytics/plugin.wasm
   # For production, use OCI registry
-  url: oci://quanzhenglong.com/camp/model-analytics:v0.0.7
+  url: oci://quanzhenglong.com/camp/model-analytics:v0.0.9
