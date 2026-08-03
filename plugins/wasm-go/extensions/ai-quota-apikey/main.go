@@ -235,14 +235,16 @@ func parseRuleConfig(json gjson.Result, global QuotaConfig, config *QuotaConfig)
 // API Key 处理
 // ============================================================================
 
+// anthropicStyleAuthHeaders 定义在未显式配置 api_key_header_name（即使用默认
+// Authorization）时，按优先级依次检查的 Anthropic / 透传风格认证 header。
+// 与 ai-route-auth 的 extractCredential 保持一致，避免出现「ai-route-auth 放行的
+// key，被本插件因协议头不同而拒掉」的割裂。
+var anthropicStyleAuthHeaders = []string{"x-api-key", "x-authorization", "anthropic-api-key"}
+
 // extractApiKey 从请求中提取 API Key
 func extractApiKey(ctx wrapper.HttpContext, config QuotaConfig) (string, error) {
 	if config.ApiKeySource == "header" {
-		headerValue, err := proxywasm.GetHttpRequestHeader(config.ApiKeyHeaderName)
-		if err != nil || headerValue == "" {
-			return "", errors.New("api key not found in header")
-		}
-		return extractApiKeyFromHeader(headerValue, config.ApiKeyHeaderName)
+		return extractApiKeyFromHeaders(config.ApiKeyHeaderName)
 	}
 
 	if config.ApiKeySource == "query" {
@@ -261,23 +263,58 @@ func extractApiKey(ctx wrapper.HttpContext, config QuotaConfig) (string, error) 
 	return "", errors.New("invalid api_key_source configuration")
 }
 
-// extractApiKeyFromHeader 从请求头中提取 API Key
-func extractApiKeyFromHeader(headerValue, headerName string) (string, error) {
-	if headerName == defaultAuthHeaderName {
-		if !strings.HasPrefix(headerValue, bearerPrefix) {
-			return "", errors.New("bearer token not found")
+// extractApiKeyFromHeaders 按优先级从请求头中提取原始 API Key，兼容 OpenAI 与
+// Anthropic 两种协议：
+//   - OpenAI:    Authorization: Bearer <key>
+//   - Anthropic: x-api-key: <key>
+//
+// 优先级（与 ai-route-auth / 主流 ai-proxy provider 的默认行为一致）：
+//  1. 显式配置的 api_key_header_name（非默认 Authorization 时）——运维强制指定唯一来源，
+//     按该 header 直取原值，不做 Bearer 解析。
+//  2. x-api-key / x-authorization / anthropic-api-key（Anthropic / 透传风格）。
+//  3. Authorization: Bearer <key>（OpenAI 风格）。
+func extractApiKeyFromHeaders(configuredHeader string) (string, error) {
+	// 1. 显式配置优先：仅当运维把 api_key_header_name 配成非默认值时生效。
+	if configuredHeader != "" && !strings.EqualFold(configuredHeader, defaultAuthHeaderName) {
+		if v, err := proxywasm.GetHttpRequestHeader(configuredHeader); err == nil {
+			if key := strings.TrimSpace(v); key != "" {
+				return key, nil
+			}
 		}
-		apiKey := strings.TrimSpace(headerValue[len(bearerPrefix):])
-		if apiKey == "" {
-			return "", errors.New("empty bearer token")
+		return "", errors.New("api key not found in header")
+	}
+
+	// 2. Anthropic / 透传风格 header
+	for _, h := range anthropicStyleAuthHeaders {
+		if v, err := proxywasm.GetHttpRequestHeader(h); err == nil {
+			if key := strings.TrimSpace(v); key != "" {
+				return key, nil
+			}
 		}
-		return apiKey, nil
 	}
-	apiKey := strings.TrimSpace(headerValue)
-	if apiKey == "" {
-		return "", errors.New("empty header value")
+
+	// 3. OpenAI 风格 Authorization: Bearer <key>
+	if v, err := proxywasm.GetHttpRequestHeader(defaultAuthHeaderName); err == nil {
+		if key := extractBearerToken(v); key != "" {
+			return key, nil
+		}
 	}
-	return apiKey, nil
+
+	return "", errors.New("api key not found in header")
+}
+
+// extractBearerToken 从 Authorization 头中提取 token。
+// 兼容 "Bearer <token>" 与直接给出 token 两种写法（与主流 ai-proxy 一致）。
+func extractBearerToken(headerValue string) string {
+	headerValue = strings.TrimSpace(headerValue)
+	if headerValue == "" {
+		return ""
+	}
+	if len(headerValue) >= len(bearerPrefix) &&
+		strings.EqualFold(headerValue[:len(bearerPrefix)], bearerPrefix) {
+		return strings.TrimSpace(headerValue[len(bearerPrefix):])
+	}
+	return headerValue
 }
 
 // hashApiKey 使用 SHA256 对 API Key 进行哈希

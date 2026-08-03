@@ -39,6 +39,16 @@ const (
 	// Bearer token prefix
 	bearerPrefix = "Bearer "
 
+	// headerOriginalAuth 保存本网关首跳时用户的原始凭证。ai-proxy 在把 Authorization
+	// 替换成上游 provider 的 apiToken 之前，会把原值写进这个 header
+	// （ai-proxy/main.go saveContextsToHeaders → util.SetOriginalRequestAuth）。
+	headerOriginalAuth = "X-HI-ORIGINAL-AUTH"
+
+	// headerFallbackFrom 由 Envoy custom_response 的 RedirectPolicy 在 internal_redirect
+	// 时注入，是「当前这趟 filter chain 是本网关内部重入」的信号（AI 模型降级重试走的就是
+	// internal_redirect）。ai-proxy 用的是同一个信号（ai-proxy/main.go initContext）。
+	headerFallbackFrom = "x-higress-fallback-from"
+
 	// Protection space for WWW-Authenticate header
 	protectionSpace = "Higress Gateway"
 )
@@ -394,12 +404,38 @@ var anthropicStyleAuthHeaders = []string{"x-api-key", "x-authorization", "anthro
 //   - Anthropic: x-api-key: <key>
 //
 // 优先级（与主流 ai-proxy provider 的默认行为一致）：
+//  0. internal_redirect 重入时的 X-HI-ORIGINAL-AUTH（见下）
 //  1. 显式配置的 auth_header_name（非默认值时）——运维可强制指定唯一来源
 //  2. x-api-key / x-authorization / anthropic-api-key（Anthropic / 透传风格）
 //  3. Authorization: Bearer <key>（OpenAI 风格；无 Bearer 前缀时按原值处理）
 //
 // 返回 (apiKey, found)。found=false 表示所有候选 header 均缺失或为空。
 func extractCredential(configuredHeader string) (string, bool) {
+	// 0. AI 模型降级（fallback）重试：Envoy 走 internal_redirect 把请求重新灌进整条
+	//    filter chain，而上一趟的 ai-proxy 已经把 Authorization 换成了上游 provider 的
+	//    apiToken（如 sk-infer-<uuid>）。本插件是 AUTHZ/700，跑在 ai-proxy 之前，若仍读
+	//    Authorization 就会拿到那个 apiToken —— 它不在 user_apikeys 里，主模型有权限的调用
+	//    会在降级时被判成 403。用户的原始凭证由 ai-proxy 保存在 X-HI-ORIGINAL-AUTH 中，
+	//    这里优先取它（与内置 key-auth 依赖的 util.GetOriginalRequestAuth 同一套约定）。
+	//
+	//    只在 x-higress-fallback-from 存在时才信任 X-HI-ORIGINAL-AUTH：该 header 不是
+	//    防伪造的，首跳时客户端可以自己带一个。首跳一律以 Authorization 为准，等价于旧行为。
+	//
+	//    残留风险：首跳时客户端可以把两个 header 一起伪造，让本插件按 X-HI-ORIGINAL-AUTH
+	//    鉴权，而只读 Authorization 的 ai-quota-apikey 把用量记到另一个 key 头上。
+	//    注意 ai-proxy 注释里建议的「把这两个 header 加进 HCM internal_only_headers」在这里
+	//    【不适用】：fallback 路由本身就是靠 exact-match-header-x-higress-fallback-from 选中的，
+	//    而 internal_only_headers 对外部请求的剥离发生在 mutateRequestHeaders —— internal_redirect
+	//    重建流时会再跑一次，把这两个 header 一起剥掉，降级链路会直接失效。
+	//    正确的收口方式是让 ai-quota-apikey 用同一套凭证解析顺序，两个插件始终看到同一个 key。
+	if from, err := proxywasm.GetHttpRequestHeader(headerFallbackFrom); err == nil && from != "" {
+		if v, err := proxywasm.GetHttpRequestHeader(headerOriginalAuth); err == nil {
+			if key := extractBearerToken(v); key != "" {
+				return key, true
+			}
+		}
+	}
+
 	// 1. 显式配置优先：仅当运维把 auth_header_name 配成非默认值时生效。
 	//    此时按该 header 直取原值（不做 Bearer 解析），语义与旧行为保持一致。
 	if configuredHeader != "" && !strings.EqualFold(configuredHeader, defaultAuthHeaderName) {

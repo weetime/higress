@@ -42,6 +42,17 @@ const (
 			"allow_workspace_projects": ["ws-a:*"]
 		}]
 	}`
+
+	// AI fallback 的 internal_redirect 重入场景：主路由与 fallback 路由都对 sk-admin 放行。
+	// 重入那一趟 Authorization 已被上一趟的 ai-proxy 换成上游 provider 的 apiToken。
+	cfgFallbackRoutes = `{
+		"user_apikeys": {"admin": ["sk-admin"]},
+		"_rules_": [{
+			"_match_route_": ["route-primary", "route-primary-fallback"],
+			"rule_name": "primary",
+			"allow_apikeys": ["sk-admin"]
+		}]
+	}`
 )
 
 func authHeaders() [][2]string {
@@ -91,6 +102,94 @@ func TestBothEmptyRouteIsDenied(t *testing.T) {
 		resp := host.GetLocalResponse()
 		require.NotNil(t, resp, "两个 allow 列表都为空时该路由必须拒绝")
 		require.Equal(t, uint32(403), resp.StatusCode)
+	})
+}
+
+// fallbackHeaders 构造 AI fallback internal_redirect 重入那一趟的请求头：
+// Authorization 已被上一趟的 ai-proxy 替换成上游 provider 的 apiToken，
+// 用户的原始凭证由 ai-proxy 保存在 X-HI-ORIGINAL-AUTH 中。
+func fallbackHeaders() [][2]string {
+	return [][2]string{
+		{":authority", "example.com"},
+		{":path", "/v1/chat/completions"},
+		{":method", "POST"},
+		{"authorization", "Bearer sk-infer-upstream-provider-token"},
+		{"x-hi-original-auth", "Bearer sk-admin"},
+		{"x-higress-fallback-from", "route-primary"},
+	}
+}
+
+// fallback 重试必须复用用户的原始凭证。否则读到的是上游 apiToken，
+// 在 user_apikeys 里查不到，主模型明明有权限的调用会在降级时 403。
+func TestFallbackReentryUsesOriginalAuth(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		host, status := test.NewTestHost(json.RawMessage(cfgFallbackRoutes))
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		require.NoError(t, host.SetRouteName("route-primary-fallback"))
+
+		require.Equal(t, types.ActionContinue, host.CallOnHttpRequestHeaders(fallbackHeaders()))
+		require.Nil(t, host.GetLocalResponse(), "fallback 重试不应因 Authorization 已被改写而被拒绝")
+	})
+}
+
+// 重入时解析出的身份必须还是原始用户，而不是上游 provider token —— 下游按
+// x-mse-consumer 限流/计费的插件依赖这个值。
+func TestFallbackReentryKeepsOriginalConsumer(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		host, status := test.NewTestHost(json.RawMessage(cfgFallbackRoutes))
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		require.NoError(t, host.SetRouteName("route-primary-fallback"))
+
+		host.CallOnHttpRequestHeaders(fallbackHeaders())
+		got := map[string]string{}
+		for _, h := range host.GetRequestHeaders() {
+			got[h[0]] = h[1]
+		}
+		require.Equal(t, "admin/sk-admin", got["x-mse-consumer"])
+	})
+}
+
+// 首跳（无 x-higress-fallback-from）必须忽略客户端伪造的 X-HI-ORIGINAL-AUTH，
+// 只认 Authorization —— 该 header 只有在网关自己的 internal_redirect 重入时才可信。
+func TestFirstHopIgnoresSpoofedOriginalAuth(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		host, status := test.NewTestHost(json.RawMessage(cfgFallbackRoutes))
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		require.NoError(t, host.SetRouteName("route-primary"))
+
+		host.CallOnHttpRequestHeaders([][2]string{
+			{":authority", "example.com"},
+			{":path", "/v1/chat/completions"},
+			{":method", "POST"},
+			{"authorization", "Bearer sk-not-a-user-key"},
+			{"x-hi-original-auth", "Bearer sk-admin"},
+		})
+		resp := host.GetLocalResponse()
+		require.NotNil(t, resp, "首跳不得信任伪造的 X-HI-ORIGINAL-AUTH")
+		require.Equal(t, uint32(403), resp.StatusCode)
+	})
+}
+
+// 重入时若 X-HI-ORIGINAL-AUTH 缺失（例如上游未经 ai-proxy 改写 Authorization），
+// 回落到 Authorization，保持与首跳一致的行为。
+func TestFallbackReentryFallsBackToAuthorization(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		host, status := test.NewTestHost(json.RawMessage(cfgFallbackRoutes))
+		defer host.Reset()
+		require.Equal(t, types.OnPluginStartStatusOK, status)
+		require.NoError(t, host.SetRouteName("route-primary-fallback"))
+
+		require.Equal(t, types.ActionContinue, host.CallOnHttpRequestHeaders([][2]string{
+			{":authority", "example.com"},
+			{":path", "/v1/chat/completions"},
+			{":method", "POST"},
+			{"authorization", "Bearer sk-admin"},
+			{"x-higress-fallback-from", "route-primary"},
+		}))
+		require.Nil(t, host.GetLocalResponse(), "无 X-HI-ORIGINAL-AUTH 时应回落到 Authorization")
 	})
 }
 
