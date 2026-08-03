@@ -34,6 +34,15 @@ const (
 	defaultApiKeyQueryName = "api_key"
 	bearerPrefix           = "Bearer "
 
+	// headerOriginalAuth 保存本网关首跳时用户的原始凭证。ai-proxy 在把 Authorization
+	// 替换成上游 provider 的 apiToken 之前，会把原值写进这个 header。
+	headerOriginalAuth = "X-HI-ORIGINAL-AUTH"
+
+	// headerFallbackFrom 由 Envoy custom_response 的 RedirectPolicy 在 internal_redirect
+	// 时注入，是「当前这趟 filter chain 是本网关内部重入」的信号（AI 模型降级重试走的
+	// 就是 internal_redirect）。与 ai-route-auth、ai-proxy 用的是同一个信号。
+	headerFallbackFrom = "x-higress-fallback-from"
+
 	// Context Keys - 用于在请求上下文中存储数据
 	ctxKeyChatMode       = "chatMode"
 	ctxKeyAdminMode      = "adminMode"
@@ -274,9 +283,37 @@ func extractApiKey(ctx wrapper.HttpContext, config QuotaConfig) (string, error) 
 //  2. x-api-key / x-authorization / anthropic-api-key（Anthropic / 透传风格）。
 //  3. Authorization: Bearer <key>（OpenAI 风格）。
 func extractApiKeyFromHeaders(configuredHeader string) (string, error) {
+	return resolveApiKeyFromHeaders(proxywasm.GetHttpRequestHeader, configuredHeader)
+}
+
+// headerGetter 抽出「读请求头」这一步，便于单测注入。生产实现即
+// proxywasm.GetHttpRequestHeader —— 本插件提取完 key 立刻进 Redis，测试框架又不记录
+// Redis 调用，没有这个缝隙就无法从外部断言「到底用了哪个 key」。
+type headerGetter func(string) (string, error)
+
+// resolveApiKeyFromHeaders 是 extractApiKeyFromHeaders 的可测实现，逻辑见上方注释。
+func resolveApiKeyFromHeaders(getHeader headerGetter, configuredHeader string) (string, error) {
+	// 0. AI 模型降级（fallback）重试：Envoy 走 internal_redirect 把请求重新灌进整条
+	//    filter chain，而上一趟的 ai-proxy 已经把 Authorization 换成了上游 provider 的
+	//    apiToken（如 sk-infer-<uuid>）。本插件跑在 ai-proxy 之前，若仍读 Authorization
+	//    就会把这次调用的用量记到那个 apiToken 头上 —— 用户的配额不扣，账记到一个不存在
+	//    的「用户」上。用户的原始凭证由 ai-proxy 保存在 X-HI-ORIGINAL-AUTH 中，优先取它。
+	//
+	//    只在 x-higress-fallback-from 存在时才信任 X-HI-ORIGINAL-AUTH：该 header 不是
+	//    防伪造的，首跳时客户端可以自己带一个。首跳一律走下面的常规顺序，行为不变。
+	//    这里与 ai-route-auth 的 extractCredential 保持同一套解析顺序 —— 两个插件必须
+	//    始终看到同一个 key，否则会出现「按 A 鉴权、按 B 记账」的错配。
+	if from, err := getHeader(headerFallbackFrom); err == nil && from != "" {
+		if v, err := getHeader(headerOriginalAuth); err == nil {
+			if key := extractBearerToken(v); key != "" {
+				return key, nil
+			}
+		}
+	}
+
 	// 1. 显式配置优先：仅当运维把 api_key_header_name 配成非默认值时生效。
 	if configuredHeader != "" && !strings.EqualFold(configuredHeader, defaultAuthHeaderName) {
-		if v, err := proxywasm.GetHttpRequestHeader(configuredHeader); err == nil {
+		if v, err := getHeader(configuredHeader); err == nil {
 			if key := strings.TrimSpace(v); key != "" {
 				return key, nil
 			}
@@ -286,7 +323,7 @@ func extractApiKeyFromHeaders(configuredHeader string) (string, error) {
 
 	// 2. Anthropic / 透传风格 header
 	for _, h := range anthropicStyleAuthHeaders {
-		if v, err := proxywasm.GetHttpRequestHeader(h); err == nil {
+		if v, err := getHeader(h); err == nil {
 			if key := strings.TrimSpace(v); key != "" {
 				return key, nil
 			}
@@ -294,7 +331,7 @@ func extractApiKeyFromHeaders(configuredHeader string) (string, error) {
 	}
 
 	// 3. OpenAI 风格 Authorization: Bearer <key>
-	if v, err := proxywasm.GetHttpRequestHeader(defaultAuthHeaderName); err == nil {
+	if v, err := getHeader(defaultAuthHeaderName); err == nil {
 		if key := extractBearerToken(v); key != "" {
 			return key, nil
 		}
