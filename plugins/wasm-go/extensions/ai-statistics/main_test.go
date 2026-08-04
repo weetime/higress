@@ -21,6 +21,7 @@ import (
 
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 	"github.com/higress-group/wasm-go/pkg/test"
+	"github.com/higress-group/wasm-go/pkg/wrapper"
 	"github.com/stretchr/testify/require"
 )
 
@@ -106,6 +107,33 @@ var streamingBodyConfig = func() json.RawMessage {
 			},
 		},
 		"disable_openai_usage": false,
+	})
+	return data
+}()
+
+var streamingModelExtractionConfig = func() json.RawMessage {
+	data, _ := json.Marshal(map[string]interface{}{
+		"attributes": []map[string]interface{}{
+			{
+				"key":                   "first_model",
+				"value_source":          "response_streaming_body",
+				"value":                 "model",
+				"rule":                  "first",
+				"apply_to_log":          true,
+				"apply_to_span":         false,
+				"as_separate_log_field": false,
+			},
+			{
+				"key":                   "replace_model",
+				"value_source":          "response_streaming_body",
+				"value":                 "model",
+				"rule":                  "replace",
+				"apply_to_log":          true,
+				"apply_to_span":         false,
+				"as_separate_log_field": false,
+			},
+		},
+		"disable_openai_usage": true,
 	})
 	return data
 }()
@@ -467,6 +495,17 @@ func TestOnHttpResponseHeaders(t *testing.T) {
 	})
 }
 
+func getAILogAttributes(t *testing.T, host test.TestHost) map[string]interface{} {
+	t.Helper()
+
+	raw, err := host.GetProperty([]string{wrapper.AILogKey})
+	require.NoError(t, err)
+
+	var attrs map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(wrapper.UnmarshalStr(`"`+string(raw)+`"`)), &attrs))
+	return attrs
+}
+
 func TestOnHttpStreamingBody(t *testing.T) {
 	test.RunTest(t, func(t *testing.T) {
 		// 测试流式响应体处理
@@ -507,6 +546,68 @@ func TestOnHttpStreamingBody(t *testing.T) {
 
 			result = host.GetResponseBody()
 			require.Equal(t, lastChunk, result)
+
+			host.CompleteHttp()
+		})
+
+		t.Run("streaming first and replace skip empty model chunks", func(t *testing.T) {
+			host, status := test.NewTestHost(streamingModelExtractionConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			action := host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/chat/completions"},
+				{":method", "POST"},
+			})
+			require.Equal(t, types.ActionContinue, action)
+
+			action = host.CallOnHttpResponseHeaders([][2]string{
+				{":status", "200"},
+				{"content-type", "text/event-stream"},
+			})
+			require.Equal(t, types.ActionContinue, action)
+
+			action = host.CallOnHttpStreamingResponseBody([]byte("data: {\"model\":\"\"}\n\n"), false)
+			require.Equal(t, types.ActionContinue, action)
+			action = host.CallOnHttpStreamingResponseBody([]byte("data: {\"model\":null}\n\n"), false)
+			require.Equal(t, types.ActionContinue, action)
+			action = host.CallOnHttpStreamingResponseBody([]byte("data: {\"model\":\"gpt-4o\"}\n\n"), true)
+			require.Equal(t, types.ActionContinue, action)
+
+			attrs := getAILogAttributes(t, host)
+			require.Equal(t, "gpt-4o", attrs["first_model"])
+			require.Equal(t, "gpt-4o", attrs["replace_model"])
+
+			host.CompleteHttp()
+		})
+
+		t.Run("streaming first and replace return nil when model path is missing", func(t *testing.T) {
+			host, status := test.NewTestHost(streamingModelExtractionConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			action := host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/chat/completions"},
+				{":method", "POST"},
+			})
+			require.Equal(t, types.ActionContinue, action)
+
+			action = host.CallOnHttpResponseHeaders([][2]string{
+				{":status", "200"},
+				{"content-type", "text/event-stream"},
+			})
+			require.Equal(t, types.ActionContinue, action)
+
+			action = host.CallOnHttpStreamingResponseBody([]byte("data: {\"choices\":[]}\n\n"), false)
+			require.Equal(t, types.ActionContinue, action)
+			action = host.CallOnHttpStreamingResponseBody([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"), true)
+			require.Equal(t, types.ActionContinue, action)
+
+			attrs := getAILogAttributes(t, host)
+			require.Nil(t, attrs["first_model"])
+			require.Nil(t, attrs["replace_model"])
 
 			host.CompleteHttp()
 		})
@@ -1452,6 +1553,58 @@ func TestSessionIdExtraction(t *testing.T) {
 	})
 }
 
+// TestExtractStreamingBodyByJsonPath 单独测试流式响应 body 的 JSONPath 提取规则
+func TestExtractStreamingBodyByJsonPath(t *testing.T) {
+	t.Run("first skips empty string chunk", func(t *testing.T) {
+		// Azure/OpenAI 兼容流可能先返回带空 model 的过滤结果 chunk，后续 chunk 才有真实模型名。
+		chunks := []byte(`data: {"choices":[],"created":0,"id":"","model":"","object":""}
+
+data: {"choices":[{"delta":{"content":""}}],"created":1777444731,"id":"chatcmpl-1","model":"gpt-5.4-2026-03-05","object":"chat.completion.chunk"}`)
+
+		value := extractStreamingBodyByJsonPath(chunks, "model", RuleFirst)
+
+		require.Equal(t, "gpt-5.4-2026-03-05", value)
+	})
+
+	t.Run("replace skips trailing empty string chunk", func(t *testing.T) {
+		chunks := []byte(`data: {"model":"gpt-4o"}
+
+data: {"model":""}`)
+
+		value := extractStreamingBodyByJsonPath(chunks, "model", RuleReplace)
+
+		require.Equal(t, "gpt-4o", value)
+	})
+
+	t.Run("first returns nil when path is missing in all chunks", func(t *testing.T) {
+		chunks := []byte(`data: {"choices":[]}
+
+data: {"choices":[{"delta":{"content":"hello"}}]}`)
+
+		value := extractStreamingBodyByJsonPath(chunks, "model", RuleFirst)
+
+		require.Nil(t, value)
+	})
+
+	t.Run("first skips explicit null chunk", func(t *testing.T) {
+		chunks := []byte(`data: {"model":null}
+
+data: {"model":"gpt-4o"}`)
+
+		value := extractStreamingBodyByJsonPath(chunks, "model", RuleFirst)
+
+		require.Equal(t, "gpt-4o", value)
+	})
+
+	t.Run("zero and false remain valid values", func(t *testing.T) {
+		numberValue := extractStreamingBodyByJsonPath([]byte(`data: {"usage":{"total_tokens":0}}`), "usage.total_tokens", RuleFirst)
+		boolValue := extractStreamingBodyByJsonPath([]byte(`data: {"filtered":false}`), "filtered", RuleFirst)
+
+		require.Equal(t, float64(0), numberValue)
+		require.Equal(t, false, boolValue)
+	})
+}
+
 // TestExtractStreamingToolCalls 单独测试 extractStreamingToolCalls 函数
 func TestExtractStreamingToolCalls(t *testing.T) {
 	t.Run("single tool call assembly", func(t *testing.T) {
@@ -2011,6 +2164,225 @@ func TestConfigWithDefaultAttributes(t *testing.T) {
 			host, status := test.NewTestHost(defaultRespConfig)
 			defer host.Reset()
 			require.Equal(t, types.OnPluginStartStatusOK, status)
+		})
+	})
+}
+
+func TestIsErrorResponse(t *testing.T) {
+	// Test error body detection (OpenAI/Anthropic format)
+	t.Run("error object in body", func(t *testing.T) {
+		body := []byte(`{"error": {"type": "api_error", "message": "Unauthorized"}}`)
+		require.True(t, isErrorResponse(body))
+	})
+
+	t.Run("error object with only code", func(t *testing.T) {
+		body := []byte(`{"error": {"code": "invalid_api_key"}}`)
+		require.True(t, isErrorResponse(body))
+	})
+
+	t.Run("error string in body", func(t *testing.T) {
+		body := []byte(`{"error": "Something went wrong"}`)
+		require.True(t, isErrorResponse(body))
+	})
+
+	t.Run("empty error string is not counted", func(t *testing.T) {
+		body := []byte(`{"error": ""}`)
+		require.False(t, isErrorResponse(body))
+	})
+
+	t.Run("null error is not counted", func(t *testing.T) {
+		body := []byte(`{"error": null}`)
+		require.False(t, isErrorResponse(body))
+	})
+
+	t.Run("no error field in body", func(t *testing.T) {
+		body := []byte(`{"choices": [{"message": {"content": "Hi"}}], "model": "gpt-4"}`)
+		require.False(t, isErrorResponse(body))
+	})
+
+	t.Run("nested error field not at root", func(t *testing.T) {
+		body := []byte(`{"choices": [{"error": "x"}]}`)
+		require.False(t, isErrorResponse(body))
+	})
+
+	// Empty body with HTTP status fallback is tested in TestIsErrorResponseWithHTTPStatus
+	// (requires wasm test environment for proxywasm.GetHttpResponseHeader)
+}
+
+func TestIsErrorResponseWithHTTPStatus(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		t.Run("empty body with 401 status returns true", func(t *testing.T) {
+			host, status := test.NewTestHost(basicConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/api/chat"},
+				{":method", "POST"},
+			})
+			host.CallOnHttpResponseHeaders([][2]string{
+				{":status", "401"},
+				{"content-type", "application/json"},
+			})
+
+			require.True(t, isErrorResponse([]byte{}))
+			host.CompleteHttp()
+		})
+
+		t.Run("empty body with 200 status returns false", func(t *testing.T) {
+			host, status := test.NewTestHost(basicConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/api/chat"},
+				{":method", "POST"},
+			})
+			host.CallOnHttpResponseHeaders([][2]string{
+				{":status", "200"},
+				{"content-type", "application/json"},
+			})
+
+			require.False(t, isErrorResponse([]byte{}))
+			host.CompleteHttp()
+		})
+	})
+}
+
+func TestFailureCountMetric(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		t.Run("error response body increments failure count only", func(t *testing.T) {
+			host, status := test.NewTestHost(basicConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			host.SetRouteName("api-v1")
+			host.SetClusterName("cluster-1")
+
+			host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/api/chat"},
+				{":method", "POST"},
+				{"x-mse-consumer", "user1"},
+			})
+
+			requestBody := []byte(`{"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": "Hello"}]}`)
+			host.CallOnHttpRequestBody(requestBody)
+
+			time.Sleep(10 * time.Millisecond)
+
+			host.CallOnHttpResponseHeaders([][2]string{
+				{":status", "401"},
+				{"content-type", "application/json"},
+			})
+			errorBody := []byte(`{"error": {"type": "authentication_error", "message": "Invalid API key"}}`)
+			host.CallOnHttpResponseBody(errorBody)
+
+			host.CompleteHttp()
+
+			// Verify llm_failure_count is incremented
+			failureMetric := "route.api-v1.upstream.cluster-1.model.gpt-3.5-turbo.consumer.user1.metric.llm_failure_count"
+			failureValue, err := host.GetCounterMetric(failureMetric)
+			require.NoError(t, err)
+			require.Equal(t, uint64(1), failureValue)
+
+			// Verify success metrics are NOT present (usage info unavailable in error response)
+			durationCountMetric := "route.api-v1.upstream.cluster-1.model.gpt-3.5-turbo.consumer.user1.metric.llm_duration_count"
+			_, err = host.GetCounterMetric(durationCountMetric)
+			require.Error(t, err, "llm_duration_count should not exist for error response without usage")
+		})
+
+		t.Run("success response does not increment failure count", func(t *testing.T) {
+			host, status := test.NewTestHost(basicConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			host.SetRouteName("api-v1")
+			host.SetClusterName("cluster-1")
+
+			host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/api/chat"},
+				{":method", "POST"},
+				{"x-mse-consumer", "user1"},
+			})
+
+			requestBody := []byte(`{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]}`)
+			host.CallOnHttpRequestBody(requestBody)
+
+			time.Sleep(10 * time.Millisecond)
+
+			host.CallOnHttpResponseHeaders([][2]string{
+				{":status", "200"},
+				{"content-type", "application/json"},
+			})
+			responseBody := []byte(`{
+				"choices": [{"message": {"content": "Hello!"}}],
+				"usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+				"model": "gpt-4"
+			}`)
+			host.CallOnHttpResponseBody(responseBody)
+
+			host.CompleteHttp()
+
+			// Verify llm_failure_count is NOT present
+			failureMetric := "route.api-v1.upstream.cluster-1.model.gpt-4.consumer.user1.metric.llm_failure_count"
+			_, err := host.GetCounterMetric(failureMetric)
+			require.Error(t, err, "llm_failure_count should not exist for successful response")
+
+			// Verify success metrics exist
+			durationCountMetric := "route.api-v1.upstream.cluster-1.model.gpt-4.consumer.user1.metric.llm_duration_count"
+			durationCountValue, err := host.GetCounterMetric(durationCountMetric)
+			require.NoError(t, err)
+			require.Equal(t, uint64(1), durationCountValue)
+		})
+	})
+}
+
+func TestStreamingFailureCountMetric(t *testing.T) {
+	test.RunTest(t, func(t *testing.T) {
+		t.Run("sse error in middle chunk before done", func(t *testing.T) {
+			host, status := test.NewTestHost(streamingBodyConfig)
+			defer host.Reset()
+			require.Equal(t, types.OnPluginStartStatusOK, status)
+
+			host.SetRouteName("api-v1")
+			host.SetClusterName("cluster-1")
+
+			host.CallOnHttpRequestHeaders([][2]string{
+				{":authority", "example.com"},
+				{":path", "/v1/chat/completions"},
+				{":method", "POST"},
+				{"x-mse-consumer", "user1"},
+			})
+
+			requestBody := []byte(`{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello"}]}`)
+			host.CallOnHttpRequestBody(requestBody)
+
+			host.CallOnHttpResponseHeaders([][2]string{
+				{":status", "200"},
+				{"content-type", "text/event-stream"},
+			})
+
+			// Simulate SSE stream: error appears in middle chunk, last chunk is [DONE]
+			chunk1 := []byte(`data: {"choices":[{"delta":{"content":"Hello"}}]}`)
+			host.CallOnHttpStreamingResponseBody(chunk1, false)
+
+			chunk2 := []byte(`data: {"error":{"type":"api_error","message":"Something went wrong"}}`)
+			host.CallOnHttpStreamingResponseBody(chunk2, false)
+
+			chunk3 := []byte(`data: [DONE]`)
+			host.CallOnHttpStreamingResponseBody(chunk3, true)
+
+			host.CompleteHttp()
+
+			// Verify llm_failure_count is incremented despite [DONE] being the last chunk
+			failureMetric := "route.api-v1.upstream.cluster-1.model.gpt-4.consumer.user1.metric.llm_failure_count"
+			failureValue, err := host.GetCounterMetric(failureMetric)
+			require.NoError(t, err)
+			require.Equal(t, uint64(1), failureValue)
 		})
 	})
 }

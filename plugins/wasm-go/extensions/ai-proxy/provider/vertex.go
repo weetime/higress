@@ -11,11 +11,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/alibaba/higress/plugins/wasm-go/extensions/ai-proxy/util"
+	"github.com/google/uuid"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm/types"
 	"github.com/higress-group/wasm-go/pkg/log"
@@ -46,6 +48,7 @@ const (
 	contextOpenAICompatibleMarker      = "isOpenAICompatibleRequest"
 	contextVertexRawMarker             = "isVertexRawRequest"
 	contextVertexStreamDoneMarker      = "vertexStreamDoneSent"
+	contextVertexStreamToolCallIDs     = "vertexStreamToolCallIDs"
 	vertexAnthropicVersion             = "vertex-2023-10-16"
 	vertexImageVariationDefaultPrompt  = "Create variations of the provided image."
 )
@@ -54,6 +57,10 @@ const (
 // 格式: [任意前缀]/{api-version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:{action}
 // 允许任意 basePath 前缀，兼容 basePathHandling 配置
 var vertexRawPathRegex = regexp.MustCompile(`^.*/([^/]+)/projects/([^/]+)/locations/([^/]+)/publishers/([^/]+)/models/([^/:]+):([^/?]+)`)
+
+// vertexExpressRawPathRegex 匹配 Vertex AI Express Mode 专用 REST API 路径
+// 格式: [任意前缀]/{api-version}/publishers/{publisher}/models/{model}:{action}
+var vertexExpressRawPathRegex = regexp.MustCompile(`^.*/(v[^/]+)/publishers/([^/]+)/models/([^/:]+):([^/?]+)`)
 
 type vertexProviderInitializer struct{}
 
@@ -97,12 +104,13 @@ func (v *vertexProviderInitializer) ValidateConfig(config *ProviderConfig) error
 
 func (v *vertexProviderInitializer) DefaultCapabilities() map[string]string {
 	return map[string]string{
-		string(ApiNameChatCompletion):  vertexPathTemplate,
-		string(ApiNameEmbeddings):      vertexPathTemplate,
-		string(ApiNameImageGeneration): vertexPathTemplate,
-		string(ApiNameImageEdit):       vertexPathTemplate,
-		string(ApiNameImageVariation):  vertexPathTemplate,
-		string(ApiNameVertexRaw):       "", // 空字符串表示保持原路径，不做路径转换
+		string(ApiNameChatCompletion):    vertexPathTemplate,
+		string(ApiNameEmbeddings):        vertexPathTemplate,
+		string(ApiNameImageGeneration):   vertexPathTemplate,
+		string(ApiNameImageEdit):         vertexPathTemplate,
+		string(ApiNameImageVariation):    vertexPathTemplate,
+		string(ApiNameAnthropicMessages): vertexPathAnthropicTemplate, // 原生支持 Anthropic Messages API, 透传到 :rawPredict
+		string(ApiNameVertexRaw):         "",                          // 空字符串表示保持原路径，不做路径转换
 	}
 }
 
@@ -157,7 +165,7 @@ func (v *vertexProvider) GetApiName(path string) ApiName {
 	// 优先匹配原生 Vertex AI REST API 路径，支持任意 basePath 前缀
 	// 格式: [任意前缀]/{api-version}/projects/{project}/locations/{location}/publishers/{publisher}/models/{model}:{action}
 	// 必须在其他 action 检查之前，因为 :predict、:generateContent 等 action 会被其他规则匹配
-	if vertexRawPathRegex.MatchString(path) {
+	if vertexRawPathRegex.MatchString(path) || (v.isExpressMode() && vertexExpressRawPathRegex.MatchString(path)) {
 		return ApiNameVertexRaw
 	}
 	if strings.HasSuffix(path, vertexChatCompletionAction) || strings.HasSuffix(path, vertexChatCompletionStreamAction) {
@@ -190,6 +198,17 @@ func (v *vertexProvider) TransformRequestHeaders(ctx wrapper.HttpContext, apiNam
 	}
 
 	util.OverwriteRequestHostHeader(headers, finalVertexDomain)
+
+	// 剥除 Anthropic 客户端携带的凭据头和协议头.
+	// 凭据头: vertex 一律用 OAuth Bearer 或 ?key= 鉴权, 留着只会把 sk-ant-... 泄漏到上游日志.
+	headers.Del("x-api-key")
+	headers.Del("anthropic-api-key")
+	// 协议头: vertex 的 Anthropic 端点不接受这些头 —
+	//   anthropic-beta  → vertex 不支持 Anthropic beta feature flags, 会 400
+	//   anthropic-version → vertex 的版本通过 body 里的 anthropic_version 字段传递,
+	//                       头里的 "2023-06-01" 与 vertex 预期的 "vertex-2023-10-16" 不符
+	headers.Del("anthropic-beta")
+	headers.Del("anthropic-version")
 }
 
 func (v *vertexProvider) getToken() (cached bool, err error) {
@@ -224,6 +243,34 @@ func (v *vertexProvider) getToken() (cached bool, err error) {
 	return false, err
 }
 
+func appendOrReplaceAPIKey(path, apiKey string) string {
+	if apiKey == "" {
+		return path
+	}
+
+	parsedPath, err := url.ParseRequestURI(path)
+	if err != nil {
+		// Fallback to simple append when path is not parseable.
+		if strings.Contains(path, "?") {
+			return path + "&key=" + apiKey
+		}
+		return path + "?key=" + apiKey
+	}
+
+	query := parsedPath.Query()
+	query.Set("key", apiKey)
+	parsedPath.RawQuery = query.Encode()
+	return parsedPath.RequestURI()
+}
+
+func (v *vertexProvider) getExpressAPIKey(ctx wrapper.HttpContext) string {
+	apiKey := v.config.GetApiTokenInUse(ctx)
+	if apiKey == "" {
+		apiKey = v.config.GetRandomToken()
+	}
+	return apiKey
+}
+
 func (v *vertexProvider) OnRequestBody(ctx wrapper.HttpContext, apiName ApiName, body []byte) (types.Action, error) {
 	if !v.config.isSupportedAPI(apiName) {
 		return types.ActionContinue, errUnsupportedApiName
@@ -234,8 +281,14 @@ func (v *vertexProvider) OnRequestBody(ctx wrapper.HttpContext, apiName ApiName,
 	// 注意：此检查必须在 IsOriginal() 之前，因为 Vertex Raw 模式通常与 original 协议一起使用
 	if apiName == ApiNameVertexRaw {
 		ctx.SetContext(contextVertexRawMarker, true)
-		// Express Mode 不需要 OAuth 认证
+		// Express Mode: 将 API Key 追加到 URL query 参数中
 		if v.isExpressMode() {
+			headers := util.GetRequestHeaders()
+			path := headers.Get(":path")
+			path = appendOrReplaceAPIKey(path, v.getExpressAPIKey(ctx))
+			util.OverwriteRequestPathHeader(headers, path)
+			headers.Del("Authorization")
+			util.ReplaceRequestHeaders(headers)
 			return types.ActionContinue, nil
 		}
 		// 标准模式需要获取 OAuth token
@@ -256,7 +309,10 @@ func (v *vertexProvider) OnRequestBody(ctx wrapper.HttpContext, apiName ApiName,
 	headers := util.GetRequestHeaders()
 
 	// OpenAI 兼容模式: 不转换请求体，只设置路径和进行模型映射
-	if v.isOpenAICompatibleMode() {
+	// 注意: Anthropic Messages API (/v1/messages) 一律走 native passthrough,
+	// 不受 vertexOpenAICompatible 配置影响 —— vertex 的 OpenAI 兼容端点只为 Gemini 设计,
+	// 用它转译 Claude 请求是无谓的 OpenAI 中转, 还会丢失 Anthropic 特有字段.
+	if v.isOpenAICompatibleMode() && apiName != ApiNameAnthropicMessages {
 		ctx.SetContext(contextOpenAICompatibleMarker, true)
 		body, err := v.onOpenAICompatibleRequestBody(ctx, apiName, body, headers)
 		if err != nil {
@@ -307,6 +363,8 @@ func (v *vertexProvider) TransformRequestBodyHeaders(ctx wrapper.HttpContext, ap
 	switch apiName {
 	case ApiNameChatCompletion:
 		return v.onChatCompletionRequestBody(ctx, body, headers)
+	case ApiNameAnthropicMessages:
+		return v.onAnthropicMessagesRequestBody(ctx, body, headers)
 	case ApiNameEmbeddings:
 		return v.onEmbeddingsRequestBody(ctx, body, headers)
 	case ApiNameImageGeneration:
@@ -346,6 +404,56 @@ func (v *vertexProvider) onOpenAICompatibleRequestBody(ctx wrapper.HttpContext, 
 	return body, nil
 }
 
+// onAnthropicMessagesRequestBody 处理 /v1/messages 请求, 透传 Anthropic body 到 vertex 的
+// :rawPredict / :streamRawPredict 端点. 不做任何协议转换, 仅做必要的 vertex-side adjustment:
+//  1. 模型映射 (modelMapping) —— vertex 上 Claude 模型必须用全限定名 (e.g. claude-sonnet-4@20250514)
+//  2. 构造 :rawPredict / :streamRawPredict path
+//  3. 删除 body 里的 "model" 字段 (vertex Anthropic 端点不接受 body 里的 model)
+//  4. 注入 "anthropic_version": "vertex-2023-10-16"
+//
+// 这条路径让 builtin tool (web_search_*, bash_*, computer_*, text_editor_*, code_execution_*)
+// 的 `type` 字段以及 custom tool 的 cache_control / thinking block 等 Anthropic 特有字段
+// 全部原样传到上游, 不会触发 `tools.0.custom.name` 这类校验错误.
+func (v *vertexProvider) onAnthropicMessagesRequestBody(ctx wrapper.HttpContext, body []byte, headers http.Header) ([]byte, error) {
+	stream := gjson.GetBytes(body, "stream").Bool()
+
+	model := gjson.GetBytes(body, "model").String()
+	if err := v.config.mapModel(ctx, &model); err != nil {
+		return nil, err
+	}
+
+	path := v.getAhthropicRequestPath(ctx, ApiNameAnthropicMessages, model, stream)
+	util.OverwriteRequestPathHeader(headers, path)
+
+	body, err := sjson.DeleteBytes(body, "model")
+	if err != nil {
+		return nil, fmt.Errorf("unable to strip model from anthropic body: %v", err)
+	}
+	body, err = sjson.SetBytes(body, "anthropic_version", vertexAnthropicVersion)
+	if err != nil {
+		return nil, fmt.Errorf("unable to inject anthropic_version: %v", err)
+	}
+
+	// 剥除 Anthropic beta-only 的 body 字段, vertex 的 :rawPredict 不认这些字段会 400.
+	// 例如 Claude Code 交互模式会发 context_management (上下文压缩配置).
+	for _, betaField := range []string{"context_management"} {
+		if gjson.GetBytes(body, betaField).Exists() {
+			body, _ = sjson.DeleteBytes(body, betaField)
+		}
+	}
+
+	// vertex Anthropic 端点要求 max_tokens 必填, 客户端漏传会被 400.
+	// 跟 claude provider buildClaudeTextGenRequest 保持一致, 缺省补 claudeDefaultMaxTokens.
+	if !gjson.GetBytes(body, "max_tokens").Exists() {
+		body, err = sjson.SetBytes(body, "max_tokens", claudeDefaultMaxTokens)
+		if err != nil {
+			return nil, fmt.Errorf("unable to inject default max_tokens: %v", err)
+		}
+	}
+
+	return body, nil
+}
+
 func (v *vertexProvider) onChatCompletionRequestBody(ctx wrapper.HttpContext, body []byte, headers http.Header) ([]byte, error) {
 	request := &chatCompletionRequest{}
 	err := v.config.parseRequestAndMapModel(ctx, request, body)
@@ -354,7 +462,7 @@ func (v *vertexProvider) onChatCompletionRequestBody(ctx wrapper.HttpContext, bo
 	}
 	if strings.HasPrefix(request.Model, "claude") {
 		ctx.SetContext(contextClaudeMarker, true)
-		path := v.getAhthropicRequestPath(ApiNameChatCompletion, request.Model, request.Stream)
+		path := v.getAhthropicRequestPath(ctx, ApiNameChatCompletion, request.Model, request.Stream)
 		util.OverwriteRequestPathHeader(headers, path)
 
 		claudeRequest := v.claude.buildClaudeTextGenRequest(request)
@@ -366,7 +474,7 @@ func (v *vertexProvider) onChatCompletionRequestBody(ctx wrapper.HttpContext, bo
 		}
 		return claudeBody, nil
 	} else {
-		path := v.getRequestPath(ApiNameChatCompletion, request.Model, request.Stream)
+		path := v.getRequestPath(ctx, ApiNameChatCompletion, request.Model, request.Stream)
 		util.OverwriteRequestPathHeader(headers, path)
 
 		vertexRequest, err := v.buildVertexChatRequest(request)
@@ -382,7 +490,7 @@ func (v *vertexProvider) onEmbeddingsRequestBody(ctx wrapper.HttpContext, body [
 	if err := v.config.parseRequestAndMapModel(ctx, request, body); err != nil {
 		return nil, err
 	}
-	path := v.getRequestPath(ApiNameEmbeddings, request.Model, false)
+	path := v.getRequestPath(ctx, ApiNameEmbeddings, request.Model, false)
 	util.OverwriteRequestPathHeader(headers, path)
 
 	vertexRequest := v.buildEmbeddingRequest(request)
@@ -395,7 +503,7 @@ func (v *vertexProvider) onImageGenerationRequestBody(ctx wrapper.HttpContext, b
 		return nil, err
 	}
 	// 图片生成不使用流式端点，需要完整响应
-	path := v.getRequestPath(ApiNameImageGeneration, request.Model, false)
+	path := v.getRequestPath(ctx, ApiNameImageGeneration, request.Model, false)
 	util.OverwriteRequestPathHeader(headers, path)
 
 	vertexRequest, err := v.buildVertexImageGenerationRequest(request)
@@ -442,7 +550,7 @@ func (v *vertexProvider) onImageEditRequestBody(ctx wrapper.HttpContext, body []
 		return nil, fmt.Errorf("missing prompt in request")
 	}
 
-	path := v.getRequestPath(ApiNameImageEdit, request.Model, false)
+	path := v.getRequestPath(ctx, ApiNameImageEdit, request.Model, false)
 	util.OverwriteRequestPathHeader(headers, path)
 	headers.Set("Content-Type", util.MimeTypeApplicationJson)
 	vertexRequest, err := v.buildVertexImageRequest(request.Prompt, request.Size, request.OutputFormat, imageURLs)
@@ -485,7 +593,7 @@ func (v *vertexProvider) onImageVariationRequestBody(ctx wrapper.HttpContext, bo
 		prompt = vertexImageVariationDefaultPrompt
 	}
 
-	path := v.getRequestPath(ApiNameImageVariation, request.Model, false)
+	path := v.getRequestPath(ctx, ApiNameImageVariation, request.Model, false)
 	util.OverwriteRequestPathHeader(headers, path)
 	headers.Set("Content-Type", util.MimeTypeApplicationJson)
 	vertexRequest, err := v.buildVertexImageRequest(prompt, request.Size, request.OutputFormat, imageURLs)
@@ -615,6 +723,11 @@ func (v *vertexProvider) parseImageSize(size string) (aspectRatio, imageSize str
 }
 
 func (v *vertexProvider) OnStreamingResponseBody(ctx wrapper.HttpContext, name ApiName, chunk []byte, isLastChunk bool) ([]byte, error) {
+	// Anthropic Messages API: vertex 的 :streamRawPredict 已经返回标准 Anthropic SSE, 原样透传
+	if name == ApiNameAnthropicMessages {
+		return chunk, nil
+	}
+
 	// OpenAI 兼容模式: 透传响应，但需要解码 Unicode 转义序列
 	// Vertex AI OpenAI-compatible API 返回 ASCII-safe JSON，将非 ASCII 字符编码为 \uXXXX
 	if ctx.GetContext(contextOpenAICompatibleMarker) != nil && ctx.GetContext(contextOpenAICompatibleMarker).(bool) {
@@ -694,6 +807,11 @@ func (v *vertexProvider) OnStreamingResponseBody(ctx wrapper.HttpContext, name A
 }
 
 func (v *vertexProvider) TransformResponseBody(ctx wrapper.HttpContext, apiName ApiName, body []byte) ([]byte, error) {
+	// Anthropic Messages API: vertex 的 :rawPredict 已经返回标准 Anthropic JSON, 原样透传
+	if apiName == ApiNameAnthropicMessages {
+		return body, nil
+	}
+
 	// OpenAI 兼容模式: 透传响应，但需要解码 Unicode 转义序列
 	// Vertex AI OpenAI-compatible API 返回 ASCII-safe JSON，将非 ASCII 字符编码为 \uXXXX
 	if ctx.GetContext(contextOpenAICompatibleMarker) != nil && ctx.GetContext(contextOpenAICompatibleMarker).(bool) {
@@ -755,7 +873,10 @@ func (v *vertexProvider) buildChatCompletionResponse(ctx wrapper.HttpContext, re
 				args, _ := json.Marshal(part.FunctionCall.Args)
 				choice.Message.ToolCalls = []toolCall{
 					{
-						Type: "function",
+						Id:               newOpenAIToolCallID(),
+						Type:             "function",
+						ThoughtSignature: part.ThoughtSignature,
+						ExtraContent:     buildGoogleThoughtSignatureExtraContent(part.ThoughtSignature),
 						Function: functionCall{
 							Name:      part.FunctionCall.Name,
 							Arguments: string(args),
@@ -863,7 +984,10 @@ func (v *vertexProvider) buildChatCompletionStreamResponse(ctx wrapper.HttpConte
 			choice.Delta = &chatMessage{
 				ToolCalls: []toolCall{
 					{
-						Type: "function",
+						Id:               getVertexStreamToolCallID(ctx, 0),
+						Type:             "function",
+						ThoughtSignature: part.ThoughtSignature,
+						ExtraContent:     buildGoogleThoughtSignatureExtraContent(part.ThoughtSignature),
 						Function: functionCall{
 							Name:      part.FunctionCall.Name,
 							Arguments: string(args),
@@ -905,11 +1029,29 @@ func (v *vertexProvider) buildChatCompletionStreamResponse(ctx wrapper.HttpConte
 	return &streamResponse
 }
 
+func newOpenAIToolCallID() string {
+	return fmt.Sprintf("call_%s", uuid.New().String())
+}
+
+func getVertexStreamToolCallID(ctx wrapper.HttpContext, index int) string {
+	toolCallIDs, _ := ctx.GetContext(contextVertexStreamToolCallIDs).(map[int]string)
+	if toolCallIDs == nil {
+		toolCallIDs = make(map[int]string)
+		ctx.SetContext(contextVertexStreamToolCallIDs, toolCallIDs)
+	}
+	if id := toolCallIDs[index]; id != "" {
+		return id
+	}
+	id := newOpenAIToolCallID()
+	toolCallIDs[index] = id
+	return id
+}
+
 func (v *vertexProvider) appendResponse(responseBuilder *strings.Builder, responseBody string) {
 	responseBuilder.WriteString(fmt.Sprintf("%s %s\n\n", streamDataItemKey, responseBody))
 }
 
-func (v *vertexProvider) getAhthropicRequestPath(apiName ApiName, modelId string, stream bool) string {
+func (v *vertexProvider) getAhthropicRequestPath(ctx wrapper.HttpContext, apiName ApiName, modelId string, stream bool) string {
 	action := ""
 	if stream {
 		action = vertexAnthropicMessageStreamAction
@@ -920,22 +1062,15 @@ func (v *vertexProvider) getAhthropicRequestPath(apiName ApiName, modelId string
 	if v.isExpressMode() {
 		// Express Mode: 简化路径 + API Key 参数
 		basePath := fmt.Sprintf(vertexExpressPathAnthropicTemplate, modelId, action)
-		apiKey := v.config.GetRandomToken()
-		// 如果 action 已经包含 ?，使用 & 拼接
-		var fullPath string
-		if strings.Contains(action, "?") {
-			fullPath = basePath + "&key=" + apiKey
-		} else {
-			fullPath = basePath + "?key=" + apiKey
-		}
-		return fullPath
+		apiKey := v.getExpressAPIKey(ctx)
+		return appendOrReplaceAPIKey(basePath, apiKey)
 	}
 
 	path := fmt.Sprintf(vertexPathAnthropicTemplate, v.config.vertexProjectId, v.config.vertexRegion, modelId, action)
 	return path
 }
 
-func (v *vertexProvider) getRequestPath(apiName ApiName, modelId string, stream bool) string {
+func (v *vertexProvider) getRequestPath(ctx wrapper.HttpContext, apiName ApiName, modelId string, stream bool) string {
 	action := ""
 	switch apiName {
 	case ApiNameEmbeddings:
@@ -954,15 +1089,8 @@ func (v *vertexProvider) getRequestPath(apiName ApiName, modelId string, stream 
 	if v.isExpressMode() {
 		// Express Mode: 简化路径 + API Key 参数
 		basePath := fmt.Sprintf(vertexExpressPathTemplate, modelId, action)
-		apiKey := v.config.GetRandomToken()
-		// 如果 action 已经包含 ?（如 streamGenerateContent?alt=sse），使用 & 拼接
-		var fullPath string
-		if strings.Contains(action, "?") {
-			fullPath = basePath + "&key=" + apiKey
-		} else {
-			fullPath = basePath + "?key=" + apiKey
-		}
-		return fullPath
+		apiKey := v.getExpressAPIKey(ctx)
+		return appendOrReplaceAPIKey(basePath, apiKey)
 	}
 
 	path := fmt.Sprintf(vertexPathTemplate, v.config.vertexProjectId, v.config.vertexRegion, modelId, action)
@@ -1041,6 +1169,7 @@ func (v *vertexProvider) buildVertexChatRequest(request *chatCompletionRequest) 
 					Name: lastFunctionName,
 					Args: args,
 				},
+				ThoughtSignature: message.ToolCalls[0].getThoughtSignature(),
 			})
 		} else {
 			for _, part := range message.ParseContent() {
@@ -1257,6 +1386,7 @@ type vertexPart struct {
 	FunctionCall     *vertexFunctionCall     `json:"functionCall,omitempty"`
 	FunctionResponse *vertexFunctionResponse `json:"functionResponse,omitempty"`
 	Thounght         *bool                   `json:"thought,omitempty"`
+	ThoughtSignature string                  `json:"thoughtSignature,omitempty"`
 }
 
 type blob struct {

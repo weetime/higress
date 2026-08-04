@@ -20,3 +20,6 @@ istio/1.12
 
 # Snyk Security Extension - AI Rules (auto-generated)
 .cursor/rules/snyk_rules.mdc
+
+# Local working notes (design specs, implementation plans) — not for upstream PRs
+docs/superpowers/

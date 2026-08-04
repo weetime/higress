@@ -26,7 +26,6 @@ func init() {
 		wrapper.ParseConfig(parseConfig),
 		wrapper.ProcessRequestHeaders(onHttpRequestHeaders),
 		wrapper.ProcessRequestBody(onHttpRequestBody),
-		wrapper.WithRebuildAfterRequests[Config](1000),
 		wrapper.WithRebuildMaxMemBytes[Config](200*1024*1024),
 	)
 }
@@ -42,12 +41,18 @@ type Config struct {
 	prefixModelMapping []ModelMapping
 	defaultModel       string
 	enableOnPathSuffix []string
+	modelToHeader      string
 }
 
 func parseConfig(json gjson.Result, config *Config) error {
 	config.modelKey = json.Get("modelKey").String()
 	if config.modelKey == "" {
 		config.modelKey = "model"
+	}
+
+	config.modelToHeader = json.Get("modelToHeader").String()
+	if config.modelToHeader == "" {
+		config.modelToHeader = "x-higress-llm-model-final"
 	}
 
 	modelMapping := json.Get("modelMapping")
@@ -144,6 +149,8 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config Config) types.Action {
 		return types.ActionContinue
 	}
 
+	// Disable re-route since the plugin may modify some headers related to the chosen route.
+	ctx.DisableReroute()
 	// Prepare for body processing
 	proxywasm.RemoveHttpRequestHeader("content-length")
 	// 100MB buffer limit
@@ -182,6 +189,9 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config Config, body []byte) type
 		}
 	}
 
+	// update x-higress-llm-model-final header
+	proxywasm.ReplaceHttpRequestHeader(config.modelToHeader, newModel)
+	log.Debugf("set header %s: %s", config.modelToHeader, newModel)
 	if newModel != "" && newModel != oldModel {
 		newBody, err := sjson.SetBytes(body, config.modelKey, newModel)
 		if err != nil {

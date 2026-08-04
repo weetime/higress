@@ -71,7 +71,14 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig, log log.
 	// TODO: remove this verifier after envoy support send request during parseConfig
 	if err := config.oidcHandler.ValidateVerifier(); err != nil {
 		log.Critical(err.Error())
-		return types.ActionContinue
+		_ = proxywasm.SendHttpResponseWithDetail(
+			http.StatusServiceUnavailable,
+			"oidc.verifier_unavailable",
+			nil,
+			[]byte("OIDC verifier is unavailable"),
+			-1,
+		)
+		return types.ActionPause
 	}
 
 	config.oidcHandler.ServeHTTP(rw, req)
@@ -84,7 +91,11 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig, log log.
 func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig, log log.Log) types.Action {
 	value := ctx.GetContext(oidc.SetCookieHeader)
 	if value != nil {
-		proxywasm.AddHttpResponseHeader(oidc.SetCookieHeader, value.(string))
+		if cookies, ok := value.([]string); ok {
+			for _, c := range cookies {
+				proxywasm.AddHttpResponseHeader(oidc.SetCookieHeader, c)
+			}
+		}
 	}
 	config.oidcHandler.SetContext(nil)
 	return types.ActionContinue

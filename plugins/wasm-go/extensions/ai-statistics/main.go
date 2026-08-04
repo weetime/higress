@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,7 +40,6 @@ func init() {
 		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
 		wrapper.ProcessStreamingResponseBody(onHttpStreamingBody),
 		wrapper.ProcessResponseBody(onHttpResponseBody),
-		wrapper.WithRebuildAfterRequests[AIStatisticsConfig](1000),
 		wrapper.WithRebuildMaxMemBytes[AIStatisticsConfig](200*1024*1024),
 	)
 }
@@ -83,6 +83,7 @@ const (
 	LLMServiceDuration     = "llm_service_duration"
 	LLMDurationCount       = "llm_duration_count"
 	LLMStreamDurationCount = "llm_stream_duration_count"
+	LLMFailureCount        = "llm_failure_count"
 	ResponseType           = "response_type"
 	ChatID                 = "chat_id"
 	ChatRound              = "chat_round"
@@ -821,6 +822,13 @@ func onHttpStreamingBody(ctx wrapper.HttpContext, config AIStatisticsConfig, dat
 		ctx.SetUserAttribute(ChatID, chatID.String())
 	}
 
+	// Track streaming errors across chunks — SSE failures often appear as
+	// data: {"error":{...}} before data: [DONE], so the last chunk alone is
+	// insufficient for error detection.
+	if !ctx.GetBoolContext("hasStreamError", false) && isErrorResponse(data) {
+		ctx.SetContext("hasStreamError", true)
+	}
+
 	// Get requestStartTime from http context
 	requestStartTime, ok := ctx.GetContext(StatisticsRequestStartTime).(int64)
 	if !ok {
@@ -874,8 +882,13 @@ func onHttpStreamingBody(ctx wrapper.HttpContext, config AIStatisticsConfig, dat
 		debugLogAiLog(ctx)
 		_ = ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey)
 
-		// Write metrics
-		writeMetric(ctx, config)
+		// Write metrics — prefer the accumulated buffer for error detection
+		// so that errors split across multiple SSE chunks are not missed.
+		bodyForMetric := data
+		if config.shouldBufferStreamingBody && len(streamingBodyBuffer) > 0 {
+			bodyForMetric = streamingBodyBuffer
+		}
+		writeMetric(ctx, config, bodyForMetric)
 	}
 	return data
 }
@@ -929,7 +942,7 @@ func onHttpResponseBody(ctx wrapper.HttpContext, config AIStatisticsConfig, body
 	_ = ctx.WriteUserAttributeToLogWithKey(wrapper.AILogKey)
 
 	// Write metrics
-	writeMetric(ctx, config)
+	writeMetric(ctx, config, body)
 
 	return types.ActionContinue
 }
@@ -1185,13 +1198,18 @@ func getBuiltinAttributeFallback(ctx wrapper.HttpContext, config AIStatisticsCon
 	return nil
 }
 
+// extractStreamingBodyByJsonPath 从 SSE 流式响应中按 jsonPath 提取属性值。
+// 入参 data 允许包含一个或多个已经拼接的 SSE chunk，jsonPath 使用 gjson 语法，rule 决定多 chunk 场景下取首个、覆盖或拼接。
+// 返回值为提取到的业务值；当规则为 first/replace 时，仅把路径存在且非空的 chunk 视为有效 chunk，避免首个空字符串覆盖后续真实值。
+// 边界情况：append 会保留历史行为继续拼接字符串，空 chunk 不产生额外内容；不支持的 rule 返回 nil 并记录错误日志。
 func extractStreamingBodyByJsonPath(data []byte, jsonPath string, rule string) interface{} {
 	chunks := bytes.Split(bytes.TrimSpace(wrapper.UnifySSEChunk(data)), []byte("\n\n"))
 	var value interface{}
 	if rule == RuleFirst {
 		for _, chunk := range chunks {
 			jsonObj := gjson.GetBytes(chunk, jsonPath)
-			if jsonObj.Exists() {
+			// 流式响应中首个 chunk 可能携带空 model/payload，first 语义应取首个非空有效值。
+			if isNonEmptyJSONValue(jsonObj) {
 				value = jsonObj.Value()
 				break
 			}
@@ -1199,7 +1217,8 @@ func extractStreamingBodyByJsonPath(data []byte, jsonPath string, rule string) i
 	} else if rule == RuleReplace {
 		for _, chunk := range chunks {
 			jsonObj := gjson.GetBytes(chunk, jsonPath)
-			if jsonObj.Exists() {
+			// replace 语义取最后一个非空有效值，防止后续空值把已提取的业务值清空。
+			if isNonEmptyJSONValue(jsonObj) {
 				value = jsonObj.Value()
 			}
 		}
@@ -1217,6 +1236,21 @@ func extractStreamingBodyByJsonPath(data []byte, jsonPath string, rule string) i
 		log.Errorf("unsupported rule type: %s", rule)
 	}
 	return value
+}
+
+// isNonEmptyJSONValue 判断 gjson 结果是否可以作为 first/replace 的有效流式提取值。
+// 输入必须是已经按 jsonPath 查询出的结果；路径不存在、JSON null 或空字符串都视为无效。
+// 返回 true 表示该值可以写入日志、指标或 span；数字 0、布尔 false、空对象/数组仍保留为有效值，避免破坏非字符串字段的历史兼容性。
+// 边界情况：只跳过明确的空字符串，不裁剪空白字符串，避免改变调用方对原始文本值的处理。
+func isNonEmptyJSONValue(result gjson.Result) bool {
+	if !result.Exists() {
+		return false
+	}
+	value := result.Value()
+	if value == nil || value == "" {
+		return false
+	}
+	return true
 }
 
 // shouldLogDebug returns true if the log level is debug or trace
@@ -1321,7 +1355,59 @@ func setSpanAttribute(key string, value interface{}) {
 	}
 }
 
-func writeMetric(ctx wrapper.HttpContext, config AIStatisticsConfig) {
+// isErrorResponse checks whether the LLM response indicates an error.
+// Detects errors by:
+// 1. Response body contains non-null "error" field at root level (OpenAI/Anthropic format).
+//    Handles both raw JSON and SSE "data: " prefixed chunks, including multi-event
+//    streaming buffers.
+// 2. HTTP status code >= 400 as fallback when body is empty.
+//
+// Note: some providers (e.g. Anthropic streaming responses) emit {"error":""}
+// even on success; an empty-string error is treated as not-an-error to avoid
+// false positives.
+func isErrorResponse(body []byte) bool {
+	if len(body) > 0 {
+		// SSE chunks are prefixed with "data: "; accumulated buffers contain
+		// multiple SSE events separated by \n\n. Split and check each event.
+		trimmed := bytes.TrimSpace(body)
+		if bytes.HasPrefix(trimmed, []byte("data: ")) {
+			for _, event := range bytes.Split(trimmed, []byte("\n\n")) {
+				jsonBody := bytes.TrimSpace(event)
+				if bytes.HasPrefix(jsonBody, []byte("data: ")) {
+					jsonBody = jsonBody[len("data: "):]
+				}
+				if hasErrorField(jsonBody) {
+					return true
+				}
+			}
+			return false
+		}
+		return hasErrorField(body)
+	}
+	// Fallback: check HTTP status code for errors with empty body (connection reset, timeout, etc.)
+	if len(body) == 0 {
+		if statusCode, err := proxywasm.GetHttpResponseHeader(":status"); err == nil {
+			if code, err := strconv.Atoi(statusCode); err == nil && code >= 400 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasErrorField checks whether a JSON body contains a non-null, non-empty-string "error" field.
+func hasErrorField(jsonBody []byte) bool {
+	errorVal := gjson.GetBytes(jsonBody, "error")
+	if errorVal.Exists() && errorVal.Value() != nil {
+		if errorVal.Type == gjson.String && errorVal.String() == "" {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func writeMetric(ctx wrapper.HttpContext, config AIStatisticsConfig, body []byte) {
 	// Generate usage metrics
 	var ok bool
 	var route, cluster, model string
@@ -1335,6 +1421,29 @@ func writeMetric(ctx wrapper.HttpContext, config AIStatisticsConfig) {
 	if !ok {
 		log.Info("ClusterName type assert failed, skip metric record")
 		return
+	}
+
+	// Get model for metric label (may be empty for error responses)
+	modelStr := "-"
+	if m := ctx.GetUserAttribute(tokenusage.CtxKeyModel); m != nil {
+		if ms, ok := m.(string); ok {
+			modelStr = ms
+		}
+	}
+	// Fallback to request model for error responses where usage info is unavailable
+	if modelStr == "-" {
+		if rm, ok := ctx.GetContext(tokenusage.CtxKeyRequestModel).(string); ok && rm != "" {
+			modelStr = rm
+		}
+	}
+
+	// Count failure before usage check, so error responses without usage info are still counted.
+	// For streaming, also check the hasStreamError flag set during onHttpStreamingBody.
+	// llm_failure_count is intentionally incremented regardless of disableOpenaiUsage,
+	// because error responses carry no usage info and operators still need the failure
+	// signal even when usage tracking is off.
+	if isErrorResponse(body) || ctx.GetBoolContext("hasStreamError", false) {
+		config.incrementCounter(generateMetricName(route, cluster, modelStr, consumer, LLMFailureCount), 1)
 	}
 
 	if config.disableOpenaiUsage {

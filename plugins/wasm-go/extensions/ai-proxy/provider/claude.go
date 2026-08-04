@@ -16,9 +16,10 @@ import (
 
 // claudeProvider is the provider for Claude service.
 const (
-	claudeDomain           = "api.anthropic.com"
-	claudeDefaultVersion   = "2023-06-01"
-	claudeDefaultMaxTokens = 4096
+	claudeDomain                  = "api.anthropic.com"
+	claudeDefaultVersion          = "2023-06-01"
+	claudeDefaultMaxTokens        = 4096
+	claudeMinThinkingBudgetTokens = 1024
 
 	// Claude Code mode constants
 	claudeCodeUserAgent    = "claude-cli/2.1.2 (external, cli)"
@@ -66,15 +67,19 @@ type claudeChatMessageContentSource struct {
 type claudeChatMessageContent struct {
 	Type         string                          `json:"type"`
 	Text         string                          `json:"text,omitempty"`
+	Data         string                          `json:"data,omitempty"` // For redacted_thinking
 	Source       *claudeChatMessageContentSource `json:"source,omitempty"`
 	CacheControl map[string]interface{}          `json:"cache_control,omitempty"`
 	// Tool use fields
-	Id    string                 `json:"id,omitempty"`    // For tool_use
-	Name  string                 `json:"name,omitempty"`  // For tool_use
-	Input map[string]interface{} `json:"input,omitempty"` // For tool_use
+	Id    string                  `json:"id,omitempty"`    // For tool_use
+	Name  string                  `json:"name,omitempty"`  // For tool_use
+	Input *map[string]interface{} `json:"input,omitempty"` // For tool_use
 	// Tool result fields
 	ToolUseId string                      `json:"tool_use_id,omitempty"` // For tool_result
 	Content   *claudeChatMessageContentWr `json:"content,omitempty"`     // For tool_result - can be string or array
+	IsError   bool                        `json:"is_error,omitempty"`    // For tool_result
+	Signature string                      `json:"signature,omitempty"`   // For thinking
+	Thinking  string                      `json:"thinking,omitempty"`    // For thinking
 }
 
 // UnmarshalJSON implements custom JSON unmarshaling for claudeChatMessageContentWr
@@ -205,6 +210,16 @@ func (csp claudeSystemPrompt) String() string {
 type claudeThinkingConfig struct {
 	Type         string `json:"type"`
 	BudgetTokens int    `json:"budget_tokens,omitempty"`
+	Display      string `json:"display,omitempty"`
+}
+
+func hasActiveClaudeThinking(thinking *claudeThinkingConfig) bool {
+	return thinking != nil && thinking.Type != "" && thinking.Type != "disabled"
+}
+
+type claudeOutputConfig struct {
+	Effort string          `json:"effort,omitempty"`
+	Format json.RawMessage `json:"format,omitempty"`
 }
 
 type claudeTextGenRequest struct {
@@ -221,6 +236,8 @@ type claudeTextGenRequest struct {
 	Tools            []claudeTool          `json:"tools,omitempty"`
 	ServiceTier      string                `json:"service_tier,omitempty"`
 	Thinking         *claudeThinkingConfig `json:"thinking,omitempty"`
+	OutputConfig     *claudeOutputConfig   `json:"output_config,omitempty"`
+	AnthropicBeta    []string              `json:"anthropic_beta,omitempty"`
 	AnthropicVersion string                `json:"anthropic_version,omitempty"`
 }
 
@@ -239,6 +256,7 @@ type claudeTextGenResponse struct {
 type claudeTextGenContent struct {
 	Type      string                  `json:"type,omitempty"`
 	Text      *string                 `json:"text,omitempty"`      // Use pointer: empty string outputs "text":"", nil omits field
+	Data      string                  `json:"data,omitempty"`      // For redacted_thinking
 	Id        string                  `json:"id,omitempty"`        // For tool_use
 	Name      string                  `json:"name,omitempty"`      // For tool_use
 	Input     *map[string]interface{} `json:"input,omitempty"`     // Use pointer: empty map outputs "input":{}, nil omits field
@@ -272,6 +290,7 @@ type claudeTextGenDelta struct {
 	Type         string          `json:"type,omitempty"`
 	Text         string          `json:"text,omitempty"`
 	Thinking     string          `json:"thinking,omitempty"`
+	Signature    string          `json:"signature,omitempty"`
 	PartialJson  string          `json:"partial_json,omitempty"`
 	StopReason   *string         `json:"stop_reason,omitempty"`
 	StopSequence json.RawMessage `json:"stop_sequence,omitempty"` // Use RawMessage to output explicit null
@@ -323,8 +342,7 @@ func (c *claudeProvider) OnRequestHeaders(ctx wrapper.HttpContext, apiName ApiNa
 
 func (c *claudeProvider) TransformRequestHeaders(ctx wrapper.HttpContext, apiName ApiName, headers http.Header) {
 	util.OverwriteRequestPathHeaderByCapability(headers, string(apiName), c.config.capabilities)
-	domain := c.config.resolveDomain("", claudeDomain)
-	util.OverwriteRequestHostHeader(headers, domain)
+	util.OverwriteRequestHostHeader(headers, claudeDomain)
 
 	if c.config.apiVersion == "" {
 		c.config.apiVersion = claudeDefaultVersion
@@ -355,6 +373,7 @@ func (c *claudeProvider) TransformRequestHeaders(ctx wrapper.HttpContext, apiNam
 	} else {
 		// Standard mode: use x-api-key
 		headers.Set("x-api-key", c.config.GetApiTokenInUse(ctx))
+		headers.Del(util.HeaderAuthorization)
 	}
 }
 
@@ -443,8 +462,15 @@ func (c *claudeProvider) buildClaudeTextGenRequest(origRequest *chatCompletionRe
 		claudeRequest.MaxTokens = claudeDefaultMaxTokens
 	}
 
+	if origRequest.ClaudeOutputConfig != nil {
+		claudeRequest.OutputConfig = origRequest.ClaudeOutputConfig
+	}
+	if origRequest.ClaudeThinking != nil {
+		claudeRequest.Thinking = origRequest.ClaudeThinking
+	}
+
 	// Convert OpenAI reasoning parameters to Claude thinking configuration
-	if origRequest.ReasoningEffort != "" || origRequest.ReasoningMaxTokens > 0 {
+	if claudeRequest.Thinking == nil && (origRequest.ReasoningEffort != "" || origRequest.ReasoningMaxTokens > 0) {
 		var budgetTokens int
 		if origRequest.ReasoningMaxTokens > 0 {
 			budgetTokens = origRequest.ReasoningMaxTokens
@@ -461,13 +487,17 @@ func (c *claudeProvider) buildClaudeTextGenRequest(origRequest *chatCompletionRe
 				budgetTokens = 8192 // Default to medium
 			}
 		}
-		// Ensure minimum budget_tokens requirement
-		if budgetTokens < 1024 {
-			budgetTokens = 1024
+		if budgetTokens < claudeMinThinkingBudgetTokens {
+			budgetTokens = claudeMinThinkingBudgetTokens
 		}
-		claudeRequest.Thinking = &claudeThinkingConfig{
-			Type:         "enabled",
-			BudgetTokens: budgetTokens,
+		if budgetTokens >= claudeRequest.MaxTokens {
+			budgetTokens = claudeRequest.MaxTokens - 1
+		}
+		if budgetTokens >= claudeMinThinkingBudgetTokens {
+			claudeRequest.Thinking = &claudeThinkingConfig{
+				Type:         "enabled",
+				BudgetTokens: budgetTokens,
+			}
 		}
 	}
 
@@ -496,6 +526,18 @@ func (c *claudeProvider) buildClaudeTextGenRequest(origRequest *chatCompletionRe
 					IsArray:     false,
 				}
 			}
+			continue
+		}
+
+		if len(message.ClaudeContentBlocks) > 0 {
+			role := message.Role
+			if role == roleTool {
+				role = roleUser
+			}
+			claudeRequest.Messages = append(claudeRequest.Messages, claudeChatMessage{
+				Role:    role,
+				Content: NewArrayContent(message.ClaudeContentBlocks),
+			})
 			continue
 		}
 
@@ -586,7 +628,7 @@ func (c *claudeProvider) buildClaudeTextGenRequest(origRequest *chatCompletionRe
 					Type:  "tool_use",
 					Id:    tc.Id,
 					Name:  tc.Function.Name,
-					Input: inputMap,
+					Input: &inputMap,
 				})
 			}
 
@@ -673,11 +715,36 @@ func (c *claudeProvider) buildClaudeTextGenRequest(origRequest *chatCompletionRe
 		claudeRequest.Tools = append(claudeRequest.Tools, claudeTool)
 	}
 
-	if tc := origRequest.getToolChoiceObject(); tc != nil {
-		claudeRequest.ToolChoice = &claudeToolChoice{
-			Name:                   tc.Function.Name,
-			Type:                   tc.Type,
-			DisableParallelToolUse: !origRequest.ParallelToolCalls,
+	if origRequest.ToolChoice != nil {
+		parallelToolCalls := true
+		if origRequest.ParallelToolCalls != nil {
+			parallelToolCalls = *origRequest.ParallelToolCalls
+		}
+		hasThinking := hasActiveClaudeThinking(claudeRequest.Thinking)
+
+		choiceType := origRequest.getToolChoiceType()
+		if tc := origRequest.getToolChoiceObject(); !hasThinking && tc != nil && tc.Type == "function" && tc.Function.Name != "" {
+			claudeRequest.ToolChoice = &claudeToolChoice{
+				Name:                   tc.Function.Name,
+				Type:                   "tool",
+				DisableParallelToolUse: !parallelToolCalls,
+			}
+		} else if choiceType != "" {
+			switch choiceType {
+			case "required":
+				choiceType = "any"
+			case "function":
+				choiceType = "auto"
+			}
+			if hasThinking && (choiceType == "any" || choiceType == "tool") {
+				choiceType = "auto"
+			}
+			claudeRequest.ToolChoice = &claudeToolChoice{
+				Type: choiceType,
+			}
+			if choiceType != "none" {
+				claudeRequest.ToolChoice.DisableParallelToolUse = !parallelToolCalls
+			}
 		}
 	}
 
@@ -688,6 +755,9 @@ func (c *claudeProvider) responseClaude2OpenAI(ctx wrapper.HttpContext, origResp
 	// Extract text content, thinking content, and tool calls from Claude response
 	var textContent string
 	var reasoningContent string
+	var reasoningSignature string
+	var reasoningRedactedContent string
+	var nativeContent []claudeTextGenContent
 	var toolCalls []toolCall
 	for _, content := range origResponse.Content {
 		switch content.Type {
@@ -695,11 +765,20 @@ func (c *claudeProvider) responseClaude2OpenAI(ctx wrapper.HttpContext, origResp
 			if content.Text != nil {
 				textContent = *content.Text
 			}
+			nativeContent = append(nativeContent, content)
 		case "thinking":
 			if content.Thinking != nil {
 				reasoningContent = *content.Thinking
 			}
+			if content.Signature != nil {
+				reasoningSignature = *content.Signature
+			}
+			nativeContent = append(nativeContent, content)
+		case "redacted_thinking":
+			reasoningRedactedContent = content.Data
+			nativeContent = append(nativeContent, content)
 		case "tool_use":
+			nativeContent = append(nativeContent, content)
 			var args []byte
 			if content.Input != nil {
 				args, _ = json.Marshal(*content.Input)
@@ -716,10 +795,23 @@ func (c *claudeProvider) responseClaude2OpenAI(ctx wrapper.HttpContext, origResp
 			})
 		}
 	}
+	if ctx != nil {
+		needClaudeResponseConversion, _ := ctx.GetContext("needClaudeResponseConversion").(bool)
+		if needClaudeResponseConversion && len(nativeContent) > 0 {
+			ctx.SetContext(ctxKeyClaudeNativeResponseContent, nativeContent)
+		}
+	}
 
 	choice := chatCompletionChoice{
-		Index:        0,
-		Message:      &chatMessage{Role: roleAssistant, Content: textContent, ReasoningContent: reasoningContent, ToolCalls: toolCalls},
+		Index: 0,
+		Message: &chatMessage{
+			Role:                     roleAssistant,
+			Content:                  textContent,
+			ReasoningContent:         reasoningContent,
+			ReasoningSignature:       reasoningSignature,
+			ReasoningRedactedContent: reasoningRedactedContent,
+			ToolCalls:                toolCalls,
+		},
 		FinishReason: util.Ptr(stopReasonClaude2OpenAI(origResponse.StopReason)),
 	}
 
@@ -784,6 +876,21 @@ func (c *claudeProvider) streamResponseClaude2OpenAI(ctx wrapper.HttpContext, or
 		return c.createChatCompletionResponse(ctx, origResponse, choice)
 
 	case "content_block_start":
+		needClaudeResponseConversion, _ := ctx.GetContext("needClaudeResponseConversion").(bool)
+		if needClaudeResponseConversion && origResponse.ContentBlock != nil && origResponse.ContentBlock.Type == "redacted_thinking" {
+			var index int
+			if origResponse.Index != nil {
+				index = *origResponse.Index
+			}
+			choice := chatCompletionChoice{
+				Index: index,
+				Delta: &chatMessage{
+					ReasoningRedactedContent: origResponse.ContentBlock.Data,
+					ClaudeContentBlockIndex:  &index,
+				},
+			}
+			return c.createChatCompletionResponse(ctx, origResponse, choice)
+		}
 		// Handle tool_use content block start
 		if origResponse.ContentBlock != nil && origResponse.ContentBlock.Type == "tool_use" {
 			var index int
@@ -823,6 +930,7 @@ func (c *claudeProvider) streamResponseClaude2OpenAI(ctx wrapper.HttpContext, or
 					ToolCalls: []toolCall{
 						{
 							Index: index,
+							Type:  "function",
 							Function: functionCall{
 								Arguments: origResponse.Delta.PartialJson,
 							},
@@ -834,9 +942,28 @@ func (c *claudeProvider) streamResponseClaude2OpenAI(ctx wrapper.HttpContext, or
 		}
 		// Handle thinking_delta
 		if origResponse.Delta != nil && origResponse.Delta.Type == "thinking_delta" {
+			delta := &chatMessage{Reasoning: origResponse.Delta.Thinking}
+			needClaudeResponseConversion, _ := ctx.GetContext("needClaudeResponseConversion").(bool)
+			if needClaudeResponseConversion {
+				delta.ClaudeContentBlockIndex = &index
+			}
 			choice := chatCompletionChoice{
 				Index: index,
-				Delta: &chatMessage{Reasoning: origResponse.Delta.Thinking},
+				Delta: delta,
+			}
+			return c.createChatCompletionResponse(ctx, origResponse, choice)
+		}
+		if origResponse.Delta != nil && origResponse.Delta.Type == "signature_delta" {
+			needClaudeResponseConversion, _ := ctx.GetContext("needClaudeResponseConversion").(bool)
+			if !needClaudeResponseConversion {
+				return nil
+			}
+			choice := chatCompletionChoice{
+				Index: index,
+				Delta: &chatMessage{
+					ReasoningSignature:      origResponse.Delta.Signature,
+					ClaudeContentBlockIndex: &index,
+				},
 			}
 			return c.createChatCompletionResponse(ctx, origResponse, choice)
 		}
@@ -877,7 +1004,23 @@ func (c *claudeProvider) streamResponseClaude2OpenAI(ctx wrapper.HttpContext, or
 				TotalTokens:      c.usage.TotalTokens,
 			},
 		}
-	case "content_block_stop", "ping":
+	case "content_block_stop":
+		needClaudeResponseConversion, _ := ctx.GetContext("needClaudeResponseConversion").(bool)
+		if !needClaudeResponseConversion {
+			return nil
+		}
+		var index int
+		if origResponse.Index != nil {
+			index = *origResponse.Index
+		}
+		choice := chatCompletionChoice{
+			Index: index,
+			Delta: &chatMessage{
+				ClaudeContentBlockStop: &index,
+			},
+		}
+		return c.createChatCompletionResponse(ctx, origResponse, choice)
+	case "ping":
 		log.Debugf("skip processing response type: %s", origResponse.Type)
 		return nil
 	default:
@@ -924,16 +1067,16 @@ func (c *claudeProvider) insertHttpContextMessage(body []byte, content string, o
 }
 
 func (c *claudeProvider) GetApiName(path string) ApiName {
-	if strings.Contains(path, PathAnthropicMessages) {
+	if strings.HasSuffix(path, PathAnthropicMessages) {
 		return ApiNameChatCompletion
 	}
-	if strings.Contains(path, PathAnthropicComplete) {
+	if strings.HasSuffix(path, PathAnthropicComplete) {
 		return ApiNameCompletion
 	}
-	if strings.Contains(path, PathOpenAIModels) {
+	if strings.HasSuffix(path, PathOpenAIModels) {
 		return ApiNameModels
 	}
-	if strings.Contains(path, PathOpenAIEmbeddings) {
+	if strings.HasSuffix(path, PathOpenAIEmbeddings) {
 		return ApiNameEmbeddings
 	}
 	return ""

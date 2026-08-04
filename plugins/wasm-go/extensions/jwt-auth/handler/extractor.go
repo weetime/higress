@@ -82,14 +82,20 @@ func extractFromParams(keepToken bool, params []string, header HeaderProvider, l
 		return ""
 	}
 
-	url, _ := url.Parse(urlparams)
-	query := url.Query()
+	parsedURL, err := url.Parse(urlparams)
+	if err != nil {
+		log.Warnf("failed to parse path: invalid request path")
+		return ""
+	}
+	query := parsedURL.Query()
 
 	for i := range params {
 		token := query.Get(params[i])
 		if token != "" {
 			if !keepToken {
 				query.Del(params[i])
+				parsedURL.RawQuery = query.Encode()
+				_ = header.ReplaceHttpRequestHeader(":path", parsedURL.RequestURI())
 			}
 			return token
 		}
@@ -123,8 +129,8 @@ func findCookie(cookie string, key string) string {
 
 	for _, pair := range pairs {
 		pair = strings.TrimSpace(pair)
-		kv := strings.Split(pair, "=")
-		if kv[0] == key {
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) == 2 && kv[0] == key {
 			value = kv[1]
 			break
 		}

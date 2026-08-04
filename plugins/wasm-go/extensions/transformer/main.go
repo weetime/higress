@@ -39,7 +39,7 @@ func init() {
 		wrapper.ProcessRequestBodyBy(onHttpRequestBody),
 		wrapper.ProcessResponseHeadersBy(onHttpResponseHeaders),
 		wrapper.ProcessResponseBodyBy(onHttpResponseBody),
-		wrapper.WithRebuildAfterRequests[TransformerConfig](1000),
+		wrapper.WithRebuildMaxMemBytes[TransformerConfig](200*1024*1024),
 	)
 }
 
@@ -344,11 +344,12 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config TransformerConfig, log
 	isValidRequestContent := isValidRequestContentType(contentType)
 	isBodyChange := config.reqTrans.IsBodyChange()
 	needBodyMapSource := config.reqTrans.NeedBodyMapSource()
+	hasRequestBody := ctx.HasRequestBody()
 
-	log.Debugf("contentType:%s, isValidRequestContent:%v, isBodyChange:%v, needBodyMapSource:%v",
-		contentType, isValidRequestContent, isBodyChange, needBodyMapSource)
+	log.Debugf("contentType:%s, isValidRequestContent:%v, isBodyChange:%v, needBodyMapSource:%v, hasRequestBody:%v",
+		contentType, isValidRequestContent, isBodyChange, needBodyMapSource, hasRequestBody)
 
-	if isBodyChange && isValidRequestContent {
+	if isBodyChange && isValidRequestContent && hasRequestBody {
 		delete(hs, "content-length")
 	}
 
@@ -362,7 +363,7 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config TransformerConfig, log
 	ctx.SetContext("headers", hs)
 	ctx.SetContext("querys", qs)
 
-	if !isValidRequestContent || (!isBodyChange && !needBodyMapSource) {
+	if !hasRequestBody || !isValidRequestContent || (!isBodyChange && !needBodyMapSource) {
 		ctx.DontReadRequestBody()
 	} else if needBodyMapSource {
 		// we need do transform during body phase
@@ -710,8 +711,7 @@ func newTransformRule(rules []gjson.Result) (res []TransformRule, err error) {
 		var tRule TransformRule
 		tRule.operate = strings.ToLower(r.Get("operate").String())
 		if !isValidOperation(tRule.operate) {
-			errors.Wrapf(err, "invalid operate type %q", tRule.operate)
-			return
+			return nil, errors.Errorf("invalid operate type %q", tRule.operate)
 		}
 
 		if tRule.operate == "map" {
@@ -721,8 +721,7 @@ func newTransformRule(rules []gjson.Result) (res []TransformRule, err error) {
 			} else {
 				tRule.mapSource = mapSourceInJson.String()
 				if !isValidMapSource(tRule.mapSource) {
-					errors.Wrapf(err, "invalid map source %q", tRule.mapSource)
-					return
+					return nil, errors.Errorf("invalid map source %q", tRule.mapSource)
 				}
 			}
 		}
@@ -739,8 +738,7 @@ func newTransformRule(rules []gjson.Result) (res []TransformRule, err error) {
 				valueType = "string"
 			}
 			if !isValidJsonType(valueType) {
-				errors.Wrapf(err, "invalid body params type %q", valueType)
-				return
+				return nil, errors.Errorf("invalid body params type %q", valueType)
 			}
 			tRule.body = append(tRule.body, constructParam(b, tRule.operate, valueType))
 		}
@@ -1111,7 +1109,7 @@ func (h jsonHandler) handle(host, path string, oriData []byte, mapSourceData map
 				}
 				convertedAppendValue, err := convertByJsonType(valueType, appendValue)
 				if err != nil {
-					return nil, errors.Wrapf(err, errAppend.Error())
+					return nil, errors.Wrap(err, errAppend.Error())
 				}
 				oldValue := gjson.GetBytes(data, key)
 				if !oldValue.Exists() {
@@ -1333,7 +1331,7 @@ func newKvtGroup(rules []TransformRule, typ string) (g []kvtOperation, isChange 
 		case "append":
 			kvtOp.kvtOpType = AppendK
 		default:
-			return nil, false, false, errors.Wrap(err, "invalid operation type")
+			return nil, false, false, errors.Errorf("invalid operation type %q", r.operate)
 		}
 		for _, p := range prams {
 			switch r.operate {

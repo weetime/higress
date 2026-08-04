@@ -183,6 +183,338 @@ func TestClaudeProvider_BuildClaudeTextGenRequest_StandardMode(t *testing.T) {
 		assert.False(t, claudeReq.System.IsArray)
 		assert.Equal(t, "You are a helpful assistant.", claudeReq.System.StringValue)
 	})
+
+	t.Run("preserves_bridge_thinking_blocks_and_output_config", func(t *testing.T) {
+		request := &chatCompletionRequest{
+			Model:          "claude-sonnet-4-5-20250929",
+			MaxTokens:      8192,
+			ClaudeThinking: &claudeThinkingConfig{Type: "adaptive", Display: "omitted"},
+			ClaudeOutputConfig: &claudeOutputConfig{
+				Effort: "high",
+				Format: json.RawMessage(`{
+					"type":"json_schema",
+					"schema":{"type":"object","properties":{"answer":{"type":"string"}}}
+				}`),
+			},
+			Messages: []chatMessage{{
+				Role: roleAssistant,
+				ClaudeContentBlocks: []claudeChatMessageContent{
+					{Type: "thinking", Thinking: "", Signature: "sig"},
+					{Type: "redacted_thinking", Data: "opaque-base64"},
+					{Type: "text", Text: "answer"},
+				},
+			}},
+		}
+
+		claudeReq := provider.buildClaudeTextGenRequest(request)
+
+		require.NotNil(t, claudeReq.Thinking)
+		assert.Equal(t, "adaptive", claudeReq.Thinking.Type)
+		assert.Equal(t, "omitted", claudeReq.Thinking.Display)
+		require.NotNil(t, claudeReq.OutputConfig)
+		assert.Equal(t, "high", claudeReq.OutputConfig.Effort)
+		require.NotEmpty(t, claudeReq.OutputConfig.Format)
+		assert.Contains(t, string(claudeReq.OutputConfig.Format), "json_schema")
+		require.Len(t, claudeReq.Messages, 1)
+		blocks := claudeReq.Messages[0].Content.GetArrayValue()
+		require.Len(t, blocks, 3)
+		assert.Equal(t, "thinking", blocks[0].Type)
+		assert.Equal(t, "sig", blocks[0].Signature)
+		assert.Equal(t, "redacted_thinking", blocks[1].Type)
+		assert.Equal(t, "opaque-base64", blocks[1].Data)
+		assert.Equal(t, "text", blocks[2].Type)
+		assert.Equal(t, "answer", blocks[2].Text)
+	})
+
+	t.Run("drops_generated_thinking_when_max_tokens_cannot_fit_minimum_budget", func(t *testing.T) {
+		request := &chatCompletionRequest{
+			Model:           "claude-sonnet-4-5-20250929",
+			MaxTokens:       400,
+			ReasoningEffort: "low",
+			Messages: []chatMessage{
+				{Role: roleUser, Content: "Hello"},
+			},
+		}
+
+		claudeReq := provider.buildClaudeTextGenRequest(request)
+
+		assert.Equal(t, 400, claudeReq.MaxTokens)
+		assert.Nil(t, claudeReq.Thinking)
+	})
+
+	t.Run("clamps_generated_thinking_budget_below_max_tokens", func(t *testing.T) {
+		request := &chatCompletionRequest{
+			Model:           "claude-sonnet-4-5-20250929",
+			MaxTokens:       1200,
+			ReasoningEffort: "high",
+			Messages: []chatMessage{
+				{Role: roleUser, Content: "Hello"},
+			},
+		}
+
+		claudeReq := provider.buildClaudeTextGenRequest(request)
+
+		require.NotNil(t, claudeReq.Thinking)
+		assert.Equal(t, "enabled", claudeReq.Thinking.Type)
+		assert.Equal(t, 1199, claudeReq.Thinking.BudgetTokens)
+	})
+
+	t.Run("clamps_explicit_reasoning_max_tokens_below_max_tokens", func(t *testing.T) {
+		request := &chatCompletionRequest{
+			Model:     "claude-sonnet-4-5-20250929",
+			MaxTokens: 2000,
+			NonOpenAIStyleOptions: NonOpenAIStyleOptions{
+				ReasoningMaxTokens: 3000,
+			},
+			Messages: []chatMessage{
+				{Role: roleUser, Content: "Hello"},
+			},
+		}
+
+		claudeReq := provider.buildClaudeTextGenRequest(request)
+
+		require.NotNil(t, claudeReq.Thinking)
+		assert.Equal(t, "enabled", claudeReq.Thinking.Type)
+		assert.Equal(t, 1999, claudeReq.Thinking.BudgetTokens)
+	})
+
+	t.Run("maps_openai_function_tool_choice_to_claude_tool_choice", func(t *testing.T) {
+		request := &chatCompletionRequest{
+			Model:     "claude-sonnet-4-5-20250929",
+			MaxTokens: 8192,
+			Messages: []chatMessage{
+				{Role: roleUser, Content: "Search."},
+			},
+			Tools: []tool{{
+				Type: "function",
+				Function: function{
+					Name:        "web_search",
+					Description: "Search the web.",
+					Parameters:  map[string]interface{}{"type": "object"},
+				},
+			}},
+			ToolChoice: map[string]interface{}{
+				"type": "function",
+				"function": map[string]interface{}{
+					"name": "web_search",
+				},
+			},
+		}
+
+		claudeReq := provider.buildClaudeTextGenRequest(request)
+
+		require.NotNil(t, claudeReq.ToolChoice)
+		assert.Equal(t, "tool", claudeReq.ToolChoice.Type)
+		assert.Equal(t, "web_search", claudeReq.ToolChoice.Name)
+	})
+
+	t.Run("maps_openai_string_required_tool_choice_to_claude_any", func(t *testing.T) {
+		parallelToolCalls := false
+		request := &chatCompletionRequest{
+			Model:     "claude-sonnet-4-5-20250929",
+			MaxTokens: 8192,
+			Messages: []chatMessage{
+				{Role: roleUser, Content: "Search."},
+			},
+			Tools: []tool{{
+				Type: "function",
+				Function: function{
+					Name:       "web_search",
+					Parameters: map[string]interface{}{"type": "object"},
+				},
+			}},
+			ToolChoice:        "required",
+			ParallelToolCalls: &parallelToolCalls,
+		}
+
+		claudeReq := provider.buildClaudeTextGenRequest(request)
+
+		require.NotNil(t, claudeReq.ToolChoice)
+		assert.Equal(t, "any", claudeReq.ToolChoice.Type)
+		assert.Empty(t, claudeReq.ToolChoice.Name)
+		assert.True(t, claudeReq.ToolChoice.DisableParallelToolUse)
+	})
+
+	t.Run("downgrades_forced_tool_choice_to_auto_when_thinking_enabled", func(t *testing.T) {
+		request := &chatCompletionRequest{
+			Model:          "claude-sonnet-4-5-20250929",
+			MaxTokens:      8192,
+			ClaudeThinking: &claudeThinkingConfig{Type: "enabled", BudgetTokens: 8192},
+			Messages: []chatMessage{
+				{Role: roleUser, Content: "Search."},
+			},
+			Tools: []tool{{
+				Type: "function",
+				Function: function{
+					Name:       "web_search",
+					Parameters: map[string]interface{}{"type": "object"},
+				},
+			}},
+			ToolChoice: "required",
+		}
+
+		claudeReq := provider.buildClaudeTextGenRequest(request)
+
+		require.NotNil(t, claudeReq.ToolChoice)
+		assert.Equal(t, "auto", claudeReq.ToolChoice.Type)
+	})
+
+	t.Run("maps_openai_string_none_tool_choice_to_claude_none", func(t *testing.T) {
+		request := &chatCompletionRequest{
+			Model:     "claude-sonnet-4-5-20250929",
+			MaxTokens: 8192,
+			Messages: []chatMessage{
+				{Role: roleUser, Content: "Answer without tools."},
+			},
+			Tools: []tool{{
+				Type: "function",
+				Function: function{
+					Name:       "web_search",
+					Parameters: map[string]interface{}{"type": "object"},
+				},
+			}},
+			ToolChoice: "none",
+		}
+
+		claudeReq := provider.buildClaudeTextGenRequest(request)
+
+		require.NotNil(t, claudeReq.ToolChoice)
+		assert.Equal(t, "none", claudeReq.ToolChoice.Type)
+		assert.Empty(t, claudeReq.ToolChoice.Name)
+	})
+
+	t.Run("preserves_bridge_tool_result_blocks_before_role_tool_fallback", func(t *testing.T) {
+		request := &chatCompletionRequest{
+			Model:     "claude-sonnet-4-5-20250929",
+			MaxTokens: 8192,
+			Messages: []chatMessage{{
+				Role: roleTool,
+				ClaudeContentBlocks: []claudeChatMessageContent{{
+					Type:      "tool_result",
+					ToolUseId: "toolu_1",
+					IsError:   true,
+					Content: &claudeChatMessageContentWr{
+						ArrayValue: []claudeChatMessageContent{{
+							Type: "image",
+							Source: &claudeChatMessageContentSource{
+								Type:      "base64",
+								MediaType: "image/png",
+								Data:      "AAAA",
+							},
+						}},
+					},
+				}},
+			}},
+		}
+
+		claudeReq := provider.buildClaudeTextGenRequest(request)
+
+		require.Len(t, claudeReq.Messages, 1)
+		assert.Equal(t, roleUser, claudeReq.Messages[0].Role)
+		blocks := claudeReq.Messages[0].Content.GetArrayValue()
+		require.Len(t, blocks, 1)
+		assert.Equal(t, "tool_result", blocks[0].Type)
+		assert.True(t, blocks[0].IsError)
+		require.NotNil(t, blocks[0].Content)
+		require.Len(t, blocks[0].Content.ArrayValue, 1)
+		assert.Equal(t, "image", blocks[0].Content.ArrayValue[0].Type)
+	})
+}
+
+func TestClaudeProvider_ResponsePreservesNativeThinkingBlocksForClaudeConversion(t *testing.T) {
+	provider := &claudeProvider{}
+	ctx := newMockMultipartHttpContext()
+	ctx.SetContext("needClaudeResponseConversion", true)
+	thinking := "reasoning"
+	signature := "sig"
+	text := "answer"
+
+	response := provider.responseClaude2OpenAI(ctx, &claudeTextGenResponse{
+		Id:    "msg_1",
+		Model: "claude-sonnet-4-5-20250929",
+		Type:  "message",
+		Role:  roleAssistant,
+		Content: []claudeTextGenContent{
+			{Type: "thinking", Thinking: &thinking, Signature: &signature},
+			{Type: "redacted_thinking", Data: "opaque-base64"},
+			{Type: "text", Text: &text},
+		},
+	})
+	body, err := json.Marshal(response)
+	require.NoError(t, err)
+
+	converted, err := (&ClaudeToOpenAIConverter{}).ConvertOpenAIResponseToClaude(ctx, body)
+	require.NoError(t, err)
+
+	var claudeResponse claudeTextGenResponse
+	require.NoError(t, json.Unmarshal(converted, &claudeResponse))
+	require.Len(t, claudeResponse.Content, 3)
+	assert.Equal(t, "thinking", claudeResponse.Content[0].Type)
+	require.NotNil(t, claudeResponse.Content[0].Signature)
+	assert.Equal(t, "sig", *claudeResponse.Content[0].Signature)
+	assert.Equal(t, "redacted_thinking", claudeResponse.Content[1].Type)
+	assert.Equal(t, "opaque-base64", claudeResponse.Content[1].Data)
+	assert.Equal(t, "text", claudeResponse.Content[2].Type)
+}
+
+func TestClaudeProvider_StreamPreservesNativeSignatureAndStopsForClaudeConversion(t *testing.T) {
+	provider := &claudeProvider{}
+	ctx := newMockMultipartHttpContext()
+	ctx.SetContext("needClaudeResponseConversion", true)
+	converter := &ClaudeToOpenAIConverter{}
+	index := 1
+
+	signatureResponse := provider.streamResponseClaude2OpenAI(ctx, &claudeTextGenStreamResponse{
+		Type:  "content_block_delta",
+		Index: &index,
+		Delta: &claudeTextGenDelta{
+			Type:      "signature_delta",
+			Signature: "sig",
+		},
+	})
+	signatureBody, err := json.Marshal(signatureResponse)
+	require.NoError(t, err)
+	converted, err := converter.ConvertOpenAIStreamResponseToClaude(ctx, []byte("data: "+string(signatureBody)+"\n\n"))
+	require.NoError(t, err)
+	events := parseClaudeSSEEvents(t, converted)
+	require.Len(t, events, 2)
+	assert.Equal(t, "content_block_start", events[0].Name)
+	assert.Equal(t, "content_block_delta", events[1].Name)
+	assert.Equal(t, "signature_delta", events[1].Payload.Delta.Type)
+
+	stopResponse := provider.streamResponseClaude2OpenAI(ctx, &claudeTextGenStreamResponse{
+		Type:  "content_block_stop",
+		Index: &index,
+	})
+	stopBody, err := json.Marshal(stopResponse)
+	require.NoError(t, err)
+	converted, err = converter.ConvertOpenAIStreamResponseToClaude(ctx, []byte("data: "+string(stopBody)+"\n\n"))
+	require.NoError(t, err)
+	events = parseClaudeSSEEvents(t, converted)
+	require.Len(t, events, 1)
+	assert.Equal(t, "content_block_stop", events[0].Name)
+}
+
+func TestClaudeProvider_StreamToolCallArgumentDeltaIncludesFunctionType(t *testing.T) {
+	provider := &claudeProvider{}
+	ctx := newMockMultipartHttpContext()
+	index := 0
+
+	response := provider.streamResponseClaude2OpenAI(ctx, &claudeTextGenStreamResponse{
+		Type:  "content_block_delta",
+		Index: &index,
+		Delta: &claudeTextGenDelta{
+			Type:        "input_json_delta",
+			PartialJson: `{"path":"/tmp/example"}`,
+		},
+	})
+
+	require.NotNil(t, response)
+	require.Len(t, response.Choices, 1)
+	require.NotNil(t, response.Choices[0].Delta)
+	require.Len(t, response.Choices[0].Delta.ToolCalls, 1)
+	assert.Equal(t, "function", response.Choices[0].Delta.ToolCalls[0].Type)
+	assert.Equal(t, `{"path":"/tmp/example"}`, response.Choices[0].Delta.ToolCalls[0].Function.Arguments)
 }
 
 func TestClaudeProvider_BuildClaudeTextGenRequest_ClaudeCodeMode(t *testing.T) {
@@ -313,6 +645,12 @@ func TestClaudeProvider_GetApiName(t *testing.T) {
 
 	t.Run("unknown_path", func(t *testing.T) {
 		assert.Equal(t, ApiName(""), provider.GetApiName("/unknown"))
+	})
+
+	t.Run("sub_paths_should_not_match", func(t *testing.T) {
+		assert.Equal(t, ApiName(""), provider.GetApiName("/v1/messages/count_tokens"))
+		assert.Equal(t, ApiName(""), provider.GetApiName("/v1/messages/batches"))
+		assert.Equal(t, ApiName(""), provider.GetApiName("/v1/complete/something"))
 	})
 }
 
