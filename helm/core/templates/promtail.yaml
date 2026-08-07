@@ -1,5 +1,5 @@
-{{- $o11y := .Values.global.o11y  }}
-{{- if $o11y.enabled }}
+{{- $o11y := .Values.global.o11y | default dict }}
+{{- if or $o11y.enabled (dig "logging" "enabled" false $o11y) }}
 {{- $config := $o11y.promtail }}
 apiVersion: v1
 kind: ConfigMap
@@ -13,7 +13,7 @@ data:
       http_listen_port: {{ $config.port }}
 
     clients:
-    - url: http://higress-console-loki.{{ .Release.Namespace }}:3100/loki/api/v1/push
+    - url: {{ dig "logging" "external" "lokiUrl" "" $o11y | default (printf "http://higress-console-loki.%s:3100/loki/api/v1/push" .Release.Namespace) }}
 
     positions:
       filename: /tmp/promtail-positions.yaml

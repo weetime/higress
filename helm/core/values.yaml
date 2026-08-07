@@ -376,7 +376,21 @@ global:
 
   # -- Observability (o11y) configurations
   o11y:
+    # -- Master switch: enables every o11y feature group with the bundled backends,
+    # exactly as before. Feature groups below allow finer-grained control.
     enabled: false
+    # -- Logging feature group: writes the gateway access log to a file and injects
+    # the Promtail sidecar to ship it. Active when either `o11y.enabled` or
+    # `o11y.logging.enabled` is true.
+    logging:
+      enabled: false
+      external:
+        # -- Push the gateway access log to an externally-managed Loki instead of the
+        # bundled one. Full push URL, e.g. http://my-loki:3100/loki/api/v1/push.
+        # Empty uses the bundled Loki service. The target Loki is expected to be
+        # single-tenant and unauthenticated; auth and multi-tenancy (X-Scope-OrgID)
+        # are not supported yet.
+        lokiUrl: ""
     promtail:
       image:
         repository: "" # Will use global.hub if not set

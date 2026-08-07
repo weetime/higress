@@ -3,7 +3,8 @@
 Rendering the pod template of gateway component.
 */}}
 {{- define "gateway.podTemplate" -}}
-{{- $o11y := .Values.global.o11y -}}
+{{- $o11y := .Values.global.o11y | default dict -}}
+{{- $loggingEnabled := or $o11y.enabled (dig "logging" "enabled" false $o11y) -}}
 template:
   metadata:
     annotations:
@@ -203,11 +204,11 @@ template:
         - mountPath: /opt/plugins
           name: local-wasmplugins-volume
         {{- end }}
-        {{- if $o11y.enabled }}
+        {{- if $loggingEnabled }}
         - mountPath: /var/log/proxy
           name: log
         {{- end }}
-      {{- if $o11y.enabled }}
+      {{- if $loggingEnabled }}
         {{- $config := $o11y.promtail }}
       - name: promtail
         image: {{ $config.image.repository | default (printf "%s/higress/promtail" .Values.global.hub) }}:{{ $config.image.tag }}
@@ -295,7 +296,7 @@ template:
       emptyDir: {}
     - name: proxy-socket
       emptyDir: {}
-    {{- if $o11y.enabled }}
+    {{- if $loggingEnabled }}
     - name: log
       emptyDir: {}
     - name: tmp
