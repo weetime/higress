@@ -68,7 +68,7 @@ spec:
           - sk-be60bd9b-1995-42fd-b640-50b3a56ebf1b
       configDisable: false
       ingress:
-        - mcp-server-test-prometheus.internal
+        - mcp-server-camp.internal
   # 必须早于 mcp-server 托管插件（UNSPECIFIED_PHASE）执行：AUTHN 阶段保证 auth 先读 body 做鉴权、
   # 先在请求头阶段注入 x-envoy-allow-mcp-tools，host 随后才能读到并按授权过滤 tools/list。
   # 缺了 phase 时本插件默认落在 UNSPECIFIED_PHASE，与 host 同阶段、顺序不定 → 排在 host 后面则鉴权/过滤全失效。
