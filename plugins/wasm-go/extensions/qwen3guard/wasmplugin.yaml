@@ -1,0 +1,84 @@
+# Qwen3Guard WasmPlugin 示例
+#
+# 本文件是**参考示例**。集群里真正下发的 CR 由 higress-helm 的
+# charts/higress-rise/templates/qwen3guard.rise.io.yaml 渲染，两边保持语义一致。
+#
+# 下面这份配置于 2026-08-12 在 4p 集群实测通过：
+#   Unsafe 输入 → content: "QWEN3GUARD_BLOCKED_TEST"、model: "from-security-guard"（插件拦截）
+#   Safe   输入 → 正常转发到上游模型
+#   延迟 0.20s vs 未挂插件基线 0.19s
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: qwen3guard.rise.io
+  namespace: higress-system
+  annotations:
+    higress.io/wasm-plugin-description: 对接自建 Qwen3Guard-Gen 服务，对 AI 请求输入与响应输出做安全分类，命中 Unsafe 时拦截。
+    higress.io/wasm-plugin-title: qwen3guard
+  labels:
+    higress.io/resource-definer: higress
+    higress.io/wasm-plugin-built-in: "false"
+    higress.io/wasm-plugin-category: custom
+    higress.io/wasm-plugin-name: qwen3guard
+    higress.io/wasm-plugin-version: 0.0.1
+spec:
+  # ⚠️ priority 必须 > ai-proxy 的 100，否则在 AI 路由上永远不会执行（内置插件优先级
+  #    写死在 console 的 spec.yaml 里，无法调高）。300 与内置 ai-security-guard 同档：
+  #    请求阶段排在 ai-proxy 之前拿到原始 OpenAI 请求，响应阶段（filter 反序）拿到
+  #    ai-proxy 归一化后的 OpenAI 响应。
+  phase: UNSPECIFIED_PHASE
+  priority: 300
+  # 安全服务不可用时放行。插件内部各失败路径（超时/非 200/解析失败/取不到文本）本身
+  # 也是 fail-open，所以生产必须为 Guard 可用率和插件 error 日志配告警，
+  # 否则"安全防护"可能早已静默失效。
+  failStrategy: FAIL_OPEN
+  imagePullPolicy: UNSPECIFIED_POLICY
+
+  # ⚠️ defaultConfigDisable: true 时 Higress **不会**把 defaultConfig 下发给插件
+  #    （ingress_config.go 里 `if !isBoolValueTrue(obj.DefaultConfigDisable)` 才赋值），
+  #    因此完整配置必须写在每条 matchRule 里。本插件用 ParseConfigBy（非
+  #    ParseOverrideConfigBy），规则间**不继承**全局配置。
+  #
+  #    另：defaultConfigDisable: true + 无有效 matchRule 时，controller 直接不下发整个
+  #    插件（`if !hasValidRule && isBoolValueTrue(...) { return nil, nil }`），不建 wasm VM，
+  #    所以空规则是安全的惰性状态。反过来，defaultConfigDisable: false + 空 defaultConfig
+  #    会让插件收到 `{}` 并走 parseConfig，本插件有 9 项必填校验，必然 plugin start failed
+  #    → Wasm VM 配置失败 → 该 listener 全部配置更新被拒（ext-auth、cluster-key-rate-limit
+  #    已各坑过一次，全集群新配的插件会跟着一起失效）。别改成 false。
+  defaultConfigDisable: true
+
+  matchRules:
+    - config:
+        # Qwen3Guard 服务部署为平台推理服务后，nova 会自动往 McpBridge `default` 注册
+        # 一条 dns registry，Envoy cluster 名为 outbound|<port>||<serviceName>.dns，
+        # 正是本插件 dns 模式的访问目标。serviceName 直接填 registry 名，
+        # **不要**再加 .dns 后缀（否则变成 .dns.dns）。
+        #   kubectl get mcpbridge default -n higress-system -o yaml | grep -A3 llm-infer
+        serviceSource: dns
+        serviceName: llm-infer-<uuid>.internal
+        servicePort: 8000
+        domain: infer-<uuid>-headless.<项目ns>.svc.cluster.local
+        requestPath: /v1/chat/completions
+        # ⚠️ 必须是 vLLM 实际的 --served-model-name，生成规则 <项目ns>_<推理服务名>
+        #    （nova/internal/biz/inference.go:1760 buildModelName）。填错 → vLLM 404
+        #    → 插件 fail-open 静默放行，看起来一切正常但根本没检测。
+        model: <项目ns>_Qwen3Guard-Gen-0.6B-XXXX
+        timeoutMs: 3000
+        checkRequest: true
+        # 开启响应检测会移除请求的 Accept-Encoding，并按 streamBufferChars（默认 1000
+        # 字符）对流式响应分段送检，每段送的是**截至当前的完整累计回复**，Guard 侧负载
+        # 和延迟都要重新评估。流式命中风险时状态码已发出，denyCode 不生效，只能追加
+        # 拒答 SSE。建议先只开 checkRequest。
+        checkResponse: false
+        # Unsafe = 只拦 Unsafe；Controversial = 连有争议的一起拦
+        riskLevelBar: Unsafe
+        denyCode: 200
+        denyMessage: "很抱歉，我无法回答您的问题"
+      # 挂载的 AI 路由。主路由和降级路由要一起挂，否则 fallback 那一趟不受检测
+      # （参考 ai-route-auth 的 matchRules 写法）。
+      ingress:
+        - ai-route-<route>.internal
+        - ai-route-<route>.fallback.internal
+
+  # plugin-server 上的静态路径，版本段与 plugins.properties 里的 tag 一致（带 v 前缀）
+  url: http://higress-plugin-server.higress-system.svc/plugins/qwen3guard/v0.0.1/plugin.wasm
