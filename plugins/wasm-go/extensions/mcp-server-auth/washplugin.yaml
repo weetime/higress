@@ -11,7 +11,7 @@ metadata:
     higress.io/wasm-plugin-built-in: "false"
     higress.io/wasm-plugin-category: custom
     higress.io/wasm-plugin-name: mcp-server-auth
-    higress.io/wasm-plugin-version: 0.0.11
+    higress.io/wasm-plugin-version: 0.0.13
 spec:
   # defaultConfigDisable: true 时 Higress 不把 defaultConfig 传给插件（规则解析拿到的
   # globalConfig 为 nil）。因此本插件把【完整配置】（身份/工具字典 + 授权 grants）直接写在
@@ -56,7 +56,11 @@ spec:
           - apikey: sk-be60bd9b-1995-42fd-b640-50b3a56ebf1b
             tool_groups:
             - admin-tools
-          - apikey: sk-mcp-tools-discovery
+          # 发现 key 的示例占位。真实值由 nova 从环境变量 MCP_DISCOVERY_KEY 读取后自动写入
+          # grants(见 nova internal/biz/mcp_server_auth.go)，各环境独立随机，不要在此填真实值。
+          # 曾用的 sk-mcp-tools-discovery 已随源码公开(console-ui#2024)，已列入 nova 的泄漏值
+          # 黑名单，填了也会被当作未配置。
+          - apikey: sk-replace-with-env-specific-random-value
             list_only: true
             tool_groups:
             - '*'
@@ -74,5 +78,5 @@ spec:
   # 缺了 phase 时本插件默认落在 UNSPECIFIED_PHASE，与 host 同阶段、顺序不定 → 排在 host 后面则鉴权/过滤全失效。
   phase: AUTHN
   priority: 320
-  url: oci://quanzhenglong.com/camp/higress/mcp-server-auth:v0.0.11
+  url: oci://quanzhenglong.com/camp/higress/mcp-server-auth:v0.0.13
   imagePullPolicy: Always
