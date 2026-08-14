@@ -11,7 +11,7 @@ metadata:
     higress.io/wasm-plugin-built-in: "false"
     higress.io/wasm-plugin-category: custom
     higress.io/wasm-plugin-name: mcp-server-auth
-    higress.io/wasm-plugin-version: 0.0.13
+    higress.io/wasm-plugin-version: 0.0.14
 spec:
   # defaultConfigDisable: true 时 Higress 不把 defaultConfig 传给插件（规则解析拿到的
   # globalConfig 为 nil）。因此本插件把【完整配置】（身份/工具字典 + 授权 grants）直接写在
@@ -64,6 +64,38 @@ spec:
             list_only: true
             tool_groups:
             - '*'
+        # 用户身份 Header 注入（缺省关闭；关闭时行为与旧版本完全一致）
+        identity_inject:
+          enabled: false
+          cache:
+            redis:
+              service_name: redis-master.dns
+              service_port: 6379
+              database: 1        # 不用 0：db0 是 ai-quota 的配额数据且 noeviction
+              timeout: 1000
+            key_prefix: "mcp:uattr:"
+            ttl: 300             # Redis 内 TTL，决定属性变更的最坏可见延迟
+            ttl_jitter: 60       # 避免热点用户集中过期后一起回源
+            negative_ttl: 60     # 「用户不存在」的负缓存，0=关闭
+            local_ttl: 10        # VM 内一级缓存（有 512 条上限）
+          origin:
+            service_name: auc.dns
+            service_port: 8002   # 以部署态 auc Service 的 http 端口为准
+            host: auc.rise-vast-system.svc.cluster.local
+            path: /v1/user/gateway-attributes
+            timeout: 500
+            token_header: x-gateway-token
+            token: replace-with-GATEWAY_ATTR_TOKEN
+          on_error: deny         # 已定 deny(取不到属性则拒绝) | pass=放行但不带身份头
+          on_incomplete: deny    # 已定 deny(模板变量缺值则拒绝) | skip=跳过该 header
+          headers:               # Header 名与模板由管理员定；保留名会被丢弃并 warn
+            X-User-Email: "{email}"
+            X-Consumer-Id: "{username}:{user_id}"
+        # 上游固定认证头（覆盖客户端同名头）
+        upstream_auth:
+          header: Authorization
+          value_prefix: "Bearer "
+          value: replace-with-upstream-api-key
         # 向后兼容：旧 allow 列表仍可用，等价于把这些 apikey 直授全部工具
         # allow:
         #   - ak-123
@@ -78,5 +110,5 @@ spec:
   # 缺了 phase 时本插件默认落在 UNSPECIFIED_PHASE，与 host 同阶段、顺序不定 → 排在 host 后面则鉴权/过滤全失效。
   phase: AUTHN
   priority: 320
-  url: oci://quanzhenglong.com/camp/higress/mcp-server-auth:v0.0.13
+  url: oci://quanzhenglong.com/camp/higress/mcp-server-auth:v0.0.14
   imagePullPolicy: Always

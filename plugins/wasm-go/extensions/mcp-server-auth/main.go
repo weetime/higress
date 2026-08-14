@@ -45,6 +45,10 @@ const (
 	// ctxAllowedCallGroups 在请求阶段写入、在 tools/call 阶段读取，
 	// 保存当前调用者可【调用】的工具集名称列表（[]string）。
 	ctxAllowedCallGroups = "mcp_auth_allowed_call_groups"
+	// ctxRequestToken 在请求头阶段写入：该请求携带的【用户】凭证。
+	// 必须存下来——上游固定 Key 会在请求头阶段的 defer 里覆盖 Authorization，
+	// 之后 body 阶段再读那个头拿到的是上游 Key，门禁会把每个请求都判成未授权(403)。
+	ctxRequestToken = "mcp_auth_request_token"
 )
 
 // token 提取状态
@@ -104,6 +108,13 @@ type McpAuthConfig struct {
 
 	// grants 本路由（=一个 MCP server）的授权列表（主体 -> 工具集）。
 	grants []Grant
+
+	// identity 用户身份 Header 注入（缺省 Enabled=false，行为与改动前一致）。
+	identity IdentityInject
+	// upstreamAuth 上游固定认证头。
+	upstreamAuth UpstreamAuth
+	// redisClient 属性缓存客户端。nil 表示缓存不可用（退化为纯回源，Redis 是软依赖）。
+	redisClient wrapper.RedisClient
 }
 
 // ============================================================================
@@ -244,7 +255,25 @@ func parseOverrideRuleConfig(configBytes []byte, globalConfig any, ruleConfig *a
 		return true
 	})
 
-	log.Debugf("mcp-server-auth route config: %d grants", len(config.grants))
+	// 身份注入与上游认证。解析失败只会得到零值（Enabled=false）——绝不返回 error，
+	// 见本函数顶部说明。
+	config.identity = parseIdentityInject(root)
+	config.upstreamAuth = parseUpstreamAuth(root)
+
+	// Redis 客户端在解析期建立。Init 会返回 error，但【绝不能】往上抛——抛了就是整个
+	// 插件 OnPluginStart 失败 → 该 listener 全部更新被拒。建不起来就退化为纯回源。
+	if config.identity.Cache.Enabled {
+		cc := config.identity.Cache
+		client := wrapper.NewRedisClusterClient(wrapper.FQDNCluster{FQDN: cc.ServiceName, Port: cc.ServicePort})
+		if err := client.Init("", cc.Password, int64(cc.Timeout), wrapper.WithDataBase(cc.Database)); err != nil {
+			log.Warnf("mcp-server-auth: redis init failed, falling back to origin-only: %v", err)
+			config.identity.Cache.Enabled = false
+		} else {
+			config.redisClient = client
+		}
+	}
+
+	log.Debugf("mcp-server-auth route config: %d grants, identity_inject=%v", len(config.grants), config.identity.Enabled)
 	*ruleConfig = config
 	return nil
 }
@@ -261,13 +290,20 @@ func onJsonRpcRequest(ctx wrapper.HttpContext, cfg any, id utils.JsonRpcID, meth
 		log.Error("mcp-server-auth: invalid config type")
 		return types.ActionContinue
 	}
+	// headers 阶段判定身份不可用（on_error/on_incomplete = deny）：在此用 JSON-RPC
+	// 规范格式拒绝。headers 阶段发裸 403 + text/plain 会让 MCP 客户端显示成无法解析的
+	// 传输错误，所以那边只做标记、把拒绝留到这里。
+	if ctx.GetContext(ctxIdentityDenied) != nil {
+		utils.OnJsonRpcResponseError(ctx, fmt.Errorf("user identity is temporarily unavailable"), utils.ErrInternalError)
+		return types.ActionContinue
+	}
 	// 未绑定任何 grant 的路由（命中全局兜底）：不强制鉴权，放行。
 	if len(config.grants) == 0 {
 		log.Debug("mcp-server-auth: no grants on this route, skip auth")
 		return types.ActionContinue
 	}
 
-	listGroups, callGroups, consumer, deny, passed := resolveAndGate(config)
+	listGroups, callGroups, consumer, deny, passed := resolveAndGate(ctx, config)
 	if !passed {
 		return deny
 	}
@@ -293,20 +329,81 @@ func onJsonRpcRequest(ctx wrapper.HttpContext, cfg any, id utils.JsonRpcID, meth
 // 不在此拒绝——身份门禁仍由 onJsonRpcRequest 在 body 阶段处理（能发规范的 JSON-RPC 错误）。
 func onRequestHeaders(ctx wrapper.HttpContext, cfg any) types.Action {
 	config, ok := cfg.(McpAuthConfig)
-	if !ok || len(config.grants) == 0 {
-		// 本路由不鉴权（或配置异常）：身份无从确认，清掉客户端自带的身份头，避免下游误信。
+	if !ok {
 		clearConsumerHeaders()
 		return types.ActionContinue
 	}
+	// 第一件事：无条件清掉所有受管头。之后才谈解析与注入。
+	clearManagedHeaders(config)
+	// 先把用户凭证存进 ctx：下面的 defer 会覆盖 Authorization，body 阶段就再也读不到它了。
+	if tok, st := extractToken(config.Keys); st == tokenOK {
+		ctx.SetContext(ctxRequestToken, tok)
+	}
+	// 上游固定 Key 用 defer 注入——必须晚于下面读原始 Authorization 的 computeGroups /
+	// usernameOf，否则自己把要读的凭证覆盖掉了。挂起路径同样会执行 defer（此时请求只是
+	// 挂起、header 仍可写），resume 后一起发出。
+	defer applyUpstreamAuth(config.upstreamAuth)
+
+	if len(config.grants) == 0 {
+		// 本路由不鉴权：身份无从确认，受管头已清空，不注入任何身份。
+		return types.ActionContinue
+	}
 	// 只算不拒：computeGroups 无副作用，不发任何响应。拒绝仍由 body 阶段 onJsonRpcRequest 处理。
-	listGroups, _, consumer, st, matched := computeGroups(config)
+	listGroups, _, consumer, st, matched := computeGroups(ctx, config)
 	if st != tokenOK || !matched {
-		clearConsumerHeaders()
 		return types.ActionContinue
 	}
 	applyConsumerHeaders(consumer)
 	applyToolListAllowHeader(config, listGroups)
+
+	// 身份属性注入。返回 true 表示已发起异步调用（Redis / 回源 AUC），必须挂起等回调。
+	if resolveIdentity(ctx, config, usernameOf(ctx, config)) {
+		return types.HeaderStopAllIterationAndWatermark
+	}
 	return types.ActionContinue
+}
+
+// clearManagedHeaders 无条件移除所有由本插件负责的下游头。
+//
+// 必须在任何解析之前执行、且与解析结果无关。理由与 clearConsumerHeaders 相同（见其注释），
+// 并额外多一条：identity_inject.headers 里的头会被上游当作【可信身份】使用，一旦漏清，
+// 任何人带一个伪造的 X-User-Email 就能让上游把别人的邮箱当成调用者身份。
+func clearManagedHeaders(cfg McpAuthConfig) {
+	clearConsumerHeaders()
+	for _, h := range cfg.identity.managedHeaders() {
+		_ = proxywasm.RemoveHttpRequestHeader(h)
+	}
+	// ⚠️ 上游认证头【不能】在这里删。它通常就是 Authorization —— 也就是本插件自己要读的
+	// 那个 token 来源。提前删掉会让 extractToken 拿不到凭证，整条路由的认证直接 401
+	// "No Key Authentication information found"（曾真实发生）。
+	// 客户端凭证不外泄由 applyUpstreamAuth 负责：它 Replace 覆盖同名头，value 为空时才删。
+}
+
+// applyUpstreamAuth 注入上游固定认证头。放在插件里而不是用
+// higress.io/request-header-control-update 注解，是因为注解值会明文落在 Ingress 上，
+// 不满足需求里「通过平台密钥或 Secret 引用保存」。
+// 在 onRequestHeaders 的 defer 里调用，因此晚于所有读原始 Authorization 的地方
+// （computeGroups / usernameOf），不会把自己要读的凭证提前覆盖掉。
+func applyUpstreamAuth(u UpstreamAuth) {
+	if u.Header == "" {
+		return
+	}
+	if u.Value == "" {
+		// 配了上游认证头但没有值：没东西可注入，但也绝不能把客户端的凭证透传给上游。
+		_ = proxywasm.RemoveHttpRequestHeader(u.Header)
+		return
+	}
+	// Replace 本身就覆盖客户端同名头，无需先删。
+	_ = proxywasm.ReplaceHttpRequestHeader(u.Header, u.ValuePrefix+u.Value)
+}
+
+// usernameOf 复用已解析的 token 反查 username。与 computeGroups 内的口径保持一致。
+func usernameOf(ctx wrapper.HttpContext, config McpAuthConfig) string {
+	apiKey, st := tokenForRequest(ctx, config.Keys)
+	if st != tokenOK {
+		return ""
+	}
+	return config.apiKeyToUser[apiKey]
 }
 
 // consumerHeaders 是本插件注入的下游身份头。
@@ -367,7 +464,7 @@ func onFallbackHttpRequest(ctx wrapper.HttpContext, cfg any, headers [][2]string
 	if !ok || len(config.grants) == 0 {
 		return types.ActionContinue
 	}
-	_, _, consumer, deny, passed := resolveAndGate(config)
+	_, _, consumer, deny, passed := resolveAndGate(ctx, config)
 	if !passed {
 		return deny
 	}
@@ -382,8 +479,8 @@ func onFallbackHttpRequest(ctx wrapper.HttpContext, cfg any, headers [][2]string
 // computeGroups 纯计算：提取 token、算出可见/可调用工具集与 consumer，**不发任何响应**。
 // 供 headers 阶段（只算不拒）与 body 阶段（据此再决定拒绝）共用，避免在 headers 阶段误发 401/403。
 // 返回的 st 为 token 提取状态（tokenOK/tokenMissing/tokenMulti）。
-func computeGroups(config McpAuthConfig) (listGroups, callGroups []string, consumer string, st int, matched bool) {
-	apiKey, tokenSt := extractToken(config.Keys)
+func computeGroups(ctx wrapper.HttpContext, config McpAuthConfig) (listGroups, callGroups []string, consumer string, st int, matched bool) {
+	apiKey, tokenSt := tokenForRequest(ctx, config.Keys)
 	if tokenSt != tokenOK {
 		return nil, nil, "", tokenSt, false
 	}
@@ -417,8 +514,8 @@ func computeGroups(config McpAuthConfig) (listGroups, callGroups []string, consu
 
 // resolveAndGate 在 computeGroups 基础上做 server 访问门禁：按 tokenState/matched 发拒绝响应（有副作用）。
 // 仅供 body 阶段（onJsonRpcRequest / onFallbackHttpRequest）调用——它们确实需要在此拒绝。
-func resolveAndGate(config McpAuthConfig) (listGroups, callGroups []string, consumer string, deny types.Action, passed bool) {
-	listGroups, callGroups, consumer, st, matched := computeGroups(config)
+func resolveAndGate(ctx wrapper.HttpContext, config McpAuthConfig) (listGroups, callGroups []string, consumer string, deny types.Action, passed bool) {
+	listGroups, callGroups, consumer, st, matched := computeGroups(ctx, config)
 	switch st {
 	case tokenMulti:
 		return nil, nil, "", deniedMultiKeyAuthData(), false
@@ -516,6 +613,17 @@ func onToolListResponse(ctx wrapper.HttpContext, cfg any, tools gjson.Result, ra
 // ============================================================================
 // 辅助函数
 // ============================================================================
+
+// tokenForRequest 取本请求的用户凭证：优先用请求头阶段存进 ctx 的值。
+//
+// 不能只依赖当场读头：配了上游认证时 Authorization 已被换成上游固定 Key，
+// 直接读会让门禁拿错凭证。ctx 里没有(如插件未走请求头阶段)才回退到读头。
+func tokenForRequest(ctx wrapper.HttpContext, keys []string) (string, int) {
+	if v, ok := ctx.GetContext(ctxRequestToken).(string); ok && v != "" {
+		return v, tokenOK
+	}
+	return extractToken(keys)
+}
 
 // extractToken 从配置的请求头中提取唯一 token。
 // Authorization 头必须携带 Bearer scheme；其它自定义头取原始值。
