@@ -2,12 +2,16 @@
 # Wraps the shared plugins/wasm-go Makefile with this plugin's registry path.
 
 PLUGIN_NAME := mcp-server-auth
-# NOTE: unlike the other rise plugins (camp/<name>), this one is published under
-# an extra higress/ segment — camp/higress/mcp-server-auth. The deployed
-# WasmPlugin CR and helm-camp plugins.properties both reference that exact path,
-# so do NOT "normalise" it away.
+# Absolute dir of this Makefile, so VERSION resolves under `make -C` / `make -f`.
+PLUGIN_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+# All rise plugins are published under the camp/higress/ prefix —
+# camp/higress/mcp-server-auth. The deployed WasmPlugin CR and helm-camp
+# plugins.properties both reference that exact path, so do NOT "normalise"
+# the higress/ segment away.
 REGISTRY ?= quanzhenglong.com/camp/higress
-VERSION ?= latest
+# Single source of truth: the VERSION file (bare, no leading v). Keep it in sync
+# with higress.io/wasm-plugin-version in wasmplugin.yaml.
+VERSION ?= v$(shell cat $(PLUGIN_DIR)/VERSION)
 IMG ?= ${REGISTRY}/${PLUGIN_NAME}:${VERSION}
 
 # Parent directory containing the main Makefile
