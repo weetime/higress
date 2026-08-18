@@ -528,8 +528,14 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config QuotaConfig) types.Act
 	path, _ := url.Parse(rawPath)
 	chatMode, adminMode := getOperationMode(path.Path, config)
 
-	// 非 AI 相关请求，跳过处理
+	// 非 AI 相关请求，跳过处理。
+	// 必须显式 DontReadRequestBody：插件注册了 ProcessRequestBody，wasm-go wrapper
+	// 默认 needRequestBody=true，会对每个 body chunk 返回 Pause 攒全量 body；
+	// 本插件全局部署(defaultConfig 恒存在)，不 opt-out 会让网关上所有路由的请求体
+	// 被 envoy 全量缓冲，超过 connectionBufferLimits(10MB) 直接 413 掐断
+	// （大文件数据集上传被拦即此因，console-ui#2275）。
 	if chatMode == ChatModeNone {
+		ctx.DontReadRequestBody()
 		return types.ActionContinue
 	}
 
