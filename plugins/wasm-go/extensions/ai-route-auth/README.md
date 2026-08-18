@@ -23,10 +23,17 @@ VERSION=v0.0.5 make build-push
     "admin":     ["sk-aaa", "ak-bbb"],
     "username2": ["sk-ccc"]
   },
-  // 认证头名称，默认 Authorization（Bearer <token>）
+  // 可选。用于强制指定唯一的凭证来源 header。
+  // 不配置时，插件自动按优先级兼容多种协议：
+  //   x-api-key / x-authorization / anthropic-api-key（Anthropic 风格）
+  //   -> Authorization: Bearer <token>（OpenAI 风格）
   "auth_header_name": "Authorization"
 }
 ```
+
+> 双协议兼容：无需任何额外配置，插件即可同时受理 OpenAI（`Authorization: Bearer <key>`）
+> 与 Anthropic（`x-api-key: <key>`）两种请求，提取到的 key 统一用于鉴权，并回写
+> `x-mse-consumer` / `x-api-key-name` 供下游统计、配额等插件按身份消费。
 
 #### 路由配置（matchRules）
 

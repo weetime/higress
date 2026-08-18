@@ -3,9 +3,13 @@
 
 # Plugin configuration
 PLUGIN_NAME := model-analytics
-REGISTRY ?= quanzhenglong.com/camp/
-VERSION ?= v0.0.1
-IMG ?= ${REGISTRY}${PLUGIN_NAME}:${VERSION}
+# Absolute dir of this Makefile, so VERSION resolves under `make -C` / `make -f`.
+PLUGIN_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+REGISTRY ?= quanzhenglong.com/camp/higress
+# Single source of truth: the VERSION file (bare, no leading v). Keep it in sync
+# with higress.io/wasm-plugin-version in wasmplugin.yaml.
+VERSION ?= v$(shell cat $(PLUGIN_DIR)/VERSION)
+IMG ?= ${REGISTRY}/${PLUGIN_NAME}:${VERSION}
 
 # Parent directory containing the main Makefile
 PARENT_DIR := ../..

@@ -15,7 +15,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -39,6 +38,16 @@ const (
 
 	// Bearer token prefix
 	bearerPrefix = "Bearer "
+
+	// headerOriginalAuth 保存本网关首跳时用户的原始凭证。ai-proxy 在把 Authorization
+	// 替换成上游 provider 的 apiToken 之前，会把原值写进这个 header
+	// （ai-proxy/main.go saveContextsToHeaders → util.SetOriginalRequestAuth）。
+	headerOriginalAuth = "X-HI-ORIGINAL-AUTH"
+
+	// headerFallbackFrom 由 Envoy custom_response 的 RedirectPolicy 在 internal_redirect
+	// 时注入，是「当前这趟 filter chain 是本网关内部重入」的信号（AI 模型降级重试走的就是
+	// internal_redirect）。ai-proxy 用的是同一个信号（ai-proxy/main.go initContext）。
+	headerFallbackFrom = "x-higress-fallback-from"
 
 	// Protection space for WWW-Authenticate header
 	protectionSpace = "Higress Gateway"
@@ -81,7 +90,9 @@ type RouteAuthConfig struct {
 	// 从 user_apikeys 转换而来，用于快速查找
 	apiKeyMapping map[string]string
 
-	// 认证头名称，默认 "Authorization"
+	// 认证头名称。可选，用于强制指定唯一的凭证来源 header。
+	// 不配置（或配为默认 "Authorization"）时，插件按优先级自动兼容
+	// OpenAI(Authorization: Bearer) 与 Anthropic(x-api-key) 等多种协议。
 	authHeaderName string
 
 	// 允许访问的租户-项目列表（从 matchRules 中获取）
@@ -238,9 +249,7 @@ func parseRuleConfig(json gjson.Result, global RouteAuthConfig, config *RouteAut
 		}
 	}
 
-	if len(config.allowWorkspaceProjects) == 0 {
-		log.Warnf("allow_workspace_projects is empty; this route will deny all API keys")
-	} else {
+	if len(config.allowWorkspaceProjects) > 0 {
 		log.Debugf("loaded allow_workspace_projects: %v", config.allowWorkspaceProjects)
 	}
 
@@ -261,6 +270,14 @@ func parseRuleConfig(json gjson.Result, global RouteAuthConfig, config *RouteAut
 
 	if len(config.allowApiKeys) > 0 {
 		log.Debugf("loaded %d directly-authorized apikeys for this route", len(config.allowApiKeys))
+	}
+
+	// 两个授权维度是 OR 语义，只有都为空才是 deny all（与 onHttpRequestHeaders Step 1.1 的
+	// 判断保持一致）。只看 allow_workspace_projects 会对「仅配 allow_apikeys」的路由误报，
+	// 而本函数在每次配置下发时对每条 matchRule、每个 VM 都要跑一遍，误报足以淹没网关日志。
+	if len(config.allowWorkspaceProjects) == 0 && len(config.allowApiKeys) == 0 {
+		log.Warnf("rule %q: both allow_workspace_projects and allow_apikeys are empty; this route will deny all API keys",
+			json.Get("rule_name").String())
 	}
 
 	// rule_name 字段仅作为配置标识，插件逻辑中不需要使用
@@ -308,17 +325,11 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config RouteAuthConfig, log l
 		return types.ActionContinue
 	}
 
-	// Step 2: 提取 API Key
-	authHeader, err := proxywasm.GetHttpRequestHeader(config.authHeaderName)
-	if err != nil || authHeader == "" {
-		log.Warnf("auth header %q is missing", config.authHeaderName)
+	// Step 2: 提取 API Key（兼容 OpenAI 的 Authorization 与 Anthropic 的 x-api-key）
+	apiKey, found := extractCredential(config.authHeaderName)
+	if !found {
+		log.Warnf("no credential found in any supported auth header")
 		return deniedMissingAuthHeader(config.authHeaderName)
-	}
-
-	apiKey, err := extractAPIKey(authHeader, config.authHeaderName)
-	if err != nil {
-		log.Warnf("invalid auth format: %v", err)
-		return deniedInvalidAuthFormat(config.authHeaderName)
 	}
 
 	// Step 3: 查找用户
@@ -384,28 +395,88 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config RouteAuthConfig, log l
 // Helper Functions
 // ============================================================================
 
-// extractAPIKey 从认证头中提取 API Key
-// 对于 "Authorization" header，期望 "Bearer <token>" 格式
-// 对于其他 header，直接使用值
-func extractAPIKey(headerValue, headerName string) (string, error) {
-	if headerName == defaultAuthHeaderName {
-		// Authorization header: 期望 "Bearer <token>" 格式
-		if !strings.HasPrefix(headerValue, bearerPrefix) {
-			return "", errors.New("bearer token not found")
+// anthropicStyleAuthHeaders 定义在未显式配置 auth_header_name 时，按优先级依次
+// 检查的 Anthropic / 透传风格认证 header。顺序与主流 ai-proxy 保持一致。
+var anthropicStyleAuthHeaders = []string{"x-api-key", "x-authorization", "anthropic-api-key"}
+
+// extractCredential 从请求头中按优先级提取原始 API Key，兼容 OpenAI 与 Anthropic 两种协议：
+//   - OpenAI:    Authorization: Bearer <key>
+//   - Anthropic: x-api-key: <key>
+//
+// 优先级（与主流 ai-proxy provider 的默认行为一致）：
+//  0. internal_redirect 重入时的 X-HI-ORIGINAL-AUTH（见下）
+//  1. 显式配置的 auth_header_name（非默认值时）——运维可强制指定唯一来源
+//  2. x-api-key / x-authorization / anthropic-api-key（Anthropic / 透传风格）
+//  3. Authorization: Bearer <key>（OpenAI 风格；无 Bearer 前缀时按原值处理）
+//
+// 返回 (apiKey, found)。found=false 表示所有候选 header 均缺失或为空。
+func extractCredential(configuredHeader string) (string, bool) {
+	// 0. AI 模型降级（fallback）重试：Envoy 走 internal_redirect 把请求重新灌进整条
+	//    filter chain，而上一趟的 ai-proxy 已经把 Authorization 换成了上游 provider 的
+	//    apiToken（如 sk-infer-<uuid>）。本插件是 AUTHZ/700，跑在 ai-proxy 之前，若仍读
+	//    Authorization 就会拿到那个 apiToken —— 它不在 user_apikeys 里，主模型有权限的调用
+	//    会在降级时被判成 403。用户的原始凭证由 ai-proxy 保存在 X-HI-ORIGINAL-AUTH 中，
+	//    这里优先取它（与内置 key-auth 依赖的 util.GetOriginalRequestAuth 同一套约定）。
+	//
+	//    只在 x-higress-fallback-from 存在时才信任 X-HI-ORIGINAL-AUTH：该 header 不是
+	//    防伪造的，首跳时客户端可以自己带一个。首跳一律以 Authorization 为准，等价于旧行为。
+	//
+	//    残留风险：首跳时客户端可以把两个 header 一起伪造，让本插件按 X-HI-ORIGINAL-AUTH
+	//    鉴权，而只读 Authorization 的 ai-quota-apikey 把用量记到另一个 key 头上。
+	//    注意 ai-proxy 注释里建议的「把这两个 header 加进 HCM internal_only_headers」在这里
+	//    【不适用】：fallback 路由本身就是靠 exact-match-header-x-higress-fallback-from 选中的，
+	//    而 internal_only_headers 对外部请求的剥离发生在 mutateRequestHeaders —— internal_redirect
+	//    重建流时会再跑一次，把这两个 header 一起剥掉，降级链路会直接失效。
+	//    正确的收口方式是让 ai-quota-apikey 用同一套凭证解析顺序，两个插件始终看到同一个 key。
+	if from, err := proxywasm.GetHttpRequestHeader(headerFallbackFrom); err == nil && from != "" {
+		if v, err := proxywasm.GetHttpRequestHeader(headerOriginalAuth); err == nil {
+			if key := extractBearerToken(v); key != "" {
+				return key, true
+			}
 		}
-		apiKey := strings.TrimSpace(headerValue[len(bearerPrefix):])
-		if apiKey == "" {
-			return "", errors.New("empty bearer token")
-		}
-		return apiKey, nil
 	}
 
-	// 其他 header: 直接使用值
-	apiKey := strings.TrimSpace(headerValue)
-	if apiKey == "" {
-		return "", errors.New("empty header value")
+	// 1. 显式配置优先：仅当运维把 auth_header_name 配成非默认值时生效。
+	//    此时按该 header 直取原值（不做 Bearer 解析），语义与旧行为保持一致。
+	if configuredHeader != "" && !strings.EqualFold(configuredHeader, defaultAuthHeaderName) {
+		if v, err := proxywasm.GetHttpRequestHeader(configuredHeader); err == nil {
+			if key := strings.TrimSpace(v); key != "" {
+				return key, true
+			}
+		}
 	}
-	return apiKey, nil
+
+	// 2. Anthropic / 透传风格 header
+	for _, h := range anthropicStyleAuthHeaders {
+		if v, err := proxywasm.GetHttpRequestHeader(h); err == nil {
+			if key := strings.TrimSpace(v); key != "" {
+				return key, true
+			}
+		}
+	}
+
+	// 3. OpenAI 风格 Authorization: Bearer <key>
+	if v, err := proxywasm.GetHttpRequestHeader(defaultAuthHeaderName); err == nil {
+		if key := extractBearerToken(v); key != "" {
+			return key, true
+		}
+	}
+
+	return "", false
+}
+
+// extractBearerToken 从 Authorization 头中提取 token。
+// 兼容 "Bearer <token>" 与直接给出 token 两种写法（与主流 ai-proxy 一致）。
+func extractBearerToken(headerValue string) string {
+	headerValue = strings.TrimSpace(headerValue)
+	if headerValue == "" {
+		return ""
+	}
+	if len(headerValue) >= len(bearerPrefix) &&
+		strings.EqualFold(headerValue[:len(bearerPrefix)], bearerPrefix) {
+		return strings.TrimSpace(headerValue[len(bearerPrefix):])
+	}
+	return headerValue
 }
 
 // contains 检查切片中是否包含指定项
@@ -439,18 +510,6 @@ func deniedMissingAuthHeader(headerName string) types.Action {
 		pluginName+".missing_auth_header",
 		wwwAuthenticateHeader(protectionSpace),
 		[]byte(fmt.Sprintf(`{"error":"%s header is required"}`, headerName)),
-		-1,
-	)
-	return types.ActionContinue
-}
-
-// deniedInvalidAuthFormat 当认证头格式无效时返回 401
-func deniedInvalidAuthFormat(headerName string) types.Action {
-	_ = proxywasm.SendHttpResponseWithDetail(
-		http.StatusUnauthorized,
-		pluginName+".invalid_auth_format",
-		wwwAuthenticateHeader(protectionSpace),
-		[]byte(fmt.Sprintf(`{"error":"Invalid %s header format"}`, headerName)),
 		-1,
 	)
 	return types.ActionContinue
