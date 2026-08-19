@@ -1,0 +1,60 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ai-credit-check.rise.io
+  namespace: higress-system
+  annotations:
+    higress.io/wasm-plugin-description: 余额门禁。请求携带 x-mse-consumer 时，若其用户名在欠费名单中则返回 402 拒绝，否则放行。
+    higress.io/wasm-plugin-title: ai-credit-check
+  labels:
+    higress.io/resource-definer: higress
+    higress.io/wasm-plugin-built-in: "false"
+    higress.io/wasm-plugin-category: custom
+    higress.io/wasm-plugin-name: ai-credit-check
+    higress.io/wasm-plugin-version: 0.0.1
+spec:
+  defaultConfig:
+    # ========================================
+    # blocked_users: 余额已耗尽（<= 0）的用户名集合
+    # ========================================
+    # key   = username（即 x-mse-consumer 中第一个 "/" 之前的部分）
+    # value = 无意义，约定写 {}，插件只读 key
+    # 默认空 map = 不拦截任何人
+    #
+    # 计费系统按用户余额变化增删单个 key，用 JSON Merge Patch 即可，
+    # 不需要 read-modify-write，因此并发更新不会互相覆盖：
+    #
+    #   # 余额 <= 0，拉黑 alice
+    #   kubectl patch wasmplugin ai-credit-check.rise.io -n higress-system --type=merge \
+    #     -p '{"spec":{"defaultConfig":{"blocked_users":{"alice":{}}}}}'
+    #
+    #   # 余额 > 0，解封 alice（merge patch 中 null 表示删除该 key）
+    #   kubectl patch wasmplugin ai-credit-check.rise.io -n higress-system --type=merge \
+    #     -p '{"spec":{"defaultConfig":{"blocked_users":{"alice":null}}}}'
+    blocked_users: {}
+
+  # 本插件不做路由级差异化配置：欠费是账号级事实，与路由无关。
+  matchRules: []
+  # defaultConfig 必须下发到所有路由，因此不能 disable。
+  defaultConfigDisable: false
+  # FAIL_OPEN：插件默认语义就是放行，parseConfig 也不会失败，真正的失败面只剩
+  # 「wasm 拉不下来/跑不起来」。FAIL_CLOSE 下那种情况会让后续请求全部 5xx
+  # （见 api/extensions/v1alpha1/wasmplugin.pb.go:267），代价远大于「欠费用户白嫖一段时间」。
+  # 另外 FAIL_CLOSE 在这里本来就是靠不住的安全网：higress-console 的
+  # KubernetesModelConverter.setDefaultValues() 会在任何人从控制台编辑本插件时，
+  # 无条件把 failStrategy 覆写回 FAIL_OPEN。真正的兜底应该靠链路上其它环节的
+  # 默认拒绝逻辑（如 ai-route-auth 对未配置路由的 deny-all）加上对本插件的
+  # 合成探测（synthetic probing，见 README「失效策略」一节），而不是这个字段。
+  # model-analytics 同样是 FAIL_OPEN。
+  failStrategy: FAIL_OPEN
+  imagePullPolicy: UNSPECIFIED_POLICY
+  # AUTHZ/690：Higress 同 phase 内 priority 数值越大越先执行。
+  # ai-route-auth 是 AUTHZ/700，本插件必须在它之后拿到 x-mse-consumer；
+  # 又必须在 ai-quota-apikey(UNSPECIFIED/280) 之前，避免欠费请求白扣配额、
+  # 并在 model-analytics(UNSPECIFIED/100) 里产生本不该有的计费记录。
+  phase: AUTHZ
+  priority: 690
+  # For local testing, use file:// URL
+  # url: file:///opt/plugins/wasm-go/extensions/ai-credit-check/plugin.wasm
+  # For production, use OCI registry
+  url: oci://quanzhenglong.com/camp/higress/ai-credit-check:v0.0.1
