@@ -76,6 +76,16 @@ spec:
   # 必须早于 mcp-server 托管插件（UNSPECIFIED_PHASE）执行：AUTHN 阶段保证 auth 先读 body 做鉴权、
   # 先在请求头阶段注入 x-envoy-allow-mcp-tools，host 随后才能读到并按授权过滤 tools/list。
   # 缺了 phase 时本插件默认落在 UNSPECIFIED_PHASE，与 host 同阶段、顺序不定 → 排在 host 后面则鉴权/过滤全失效。
+  # FAIL_OPEN：显式写死，不依赖 CRD 默认值（failStrategy 的零值是 FAIL_CLOSE）。
+  # wasm 拉取/启动失败时绕过本插件，而不是让整个网关所有流量 5xx —— wasm filter 挂在
+  # listener 上，FAIL_CLOSE 的爆炸半径是全站而非本插件命中的路由。
+  # 顺带消除与 higress-console 的漂移：console 的 setDefaultValues() 会无条件把该字段
+  # 写成 FAIL_OPEN，之前留空等于"以为是 FAIL_CLOSE、线上其实可能不是"。
+  #
+  # 代价：工具级鉴权静默失效（tools/list 不再过滤、未授权 tool 可被调用）。
+  # 必须靠拨测发现：用一个无权限的 apikey 调受限 tool，期望拿到 JSON-RPC error；
+  # 拿到正常结果即说明本插件已被 bypass，立即告警。
+  failStrategy: FAIL_OPEN
   phase: AUTHN
   priority: 320
   url: oci://quanzhenglong.com/camp/higress/mcp-server-auth:v0.0.15

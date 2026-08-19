@@ -121,7 +121,27 @@ spec:
     #     - ai-route-infer-yyy.internal
 
   defaultConfigDisable: true
-  failStrategy: FAIL_CLOSE
+  # FAIL_OPEN：wasm 拉取/启动失败时绕过本插件，而不是让整个网关 5xx。
+  #
+  # ⚠️ 这是一个明确的取舍，不是默认值。本插件是链路上【唯一】校验 API Key 真伪的一层
+  #    （main.go Step 2 取不到凭证 -> 401，Step 3 key 不在 user_apikeys -> 403）。
+  #    FAIL_OPEN 下它一旦失效，匿名 / 伪造 key 的请求可直达推理服务；ai-quota-apikey
+  #    兜不住 —— 它只挡"完全不带 key"，不校验 key 是否合法（查不到配额配置即放行）。
+  #    且失效是【相关的】：OCI registry 挂掉会同时打掉所有插件，别指望别的插件补位。
+  #
+  # 仍然选 FAIL_OPEN 的两个理由：
+  #   1. wasm filter 挂在网关 listener 上而非按路由生效，FAIL_CLOSE 触发时是【全站】
+  #      所有流量 5xx。本环境发生过 OCI URL 被改坏导致网关 Pod 卡在 0/1 INITIALIZING。
+  #   2. higress-console 的 KubernetesModelConverter.setDefaultValues() 无条件把
+  #      failStrategy 覆盖成 FAIL_OPEN（三处调用点覆盖了从 console 改插件配置的所有路径），
+  #      只要有人在 console 上动过本插件，FAIL_CLOSE 早已被静默改掉 —— 拿它做安全兜底
+  #      本来就不可靠。
+  #
+  # 因此本插件的失效【必须靠拨测发现】，不能靠 failStrategy。定时对一条受保护路由发：
+  #   (a) 不带 Authorization        -> 期望 401
+  #   (b) 带一个不存在的 api key    -> 期望 403
+  # 任一返回 200 即说明本插件已被 bypass，立即告警。
+  failStrategy: FAIL_OPEN
   imagePullPolicy: UNSPECIFIED_POLICY
   phase: AUTHZ
   priority: 700
