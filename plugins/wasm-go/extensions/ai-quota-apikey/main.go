@@ -368,6 +368,28 @@ func getApiKeyForHash(config QuotaConfig, apiKey string) string {
 	return apiKey
 }
 
+// maskApiKey 打日志用的脱敏形式：只保留后 8 位。
+//
+// 存在的理由：hash_api_key 默认关闭，此时 apiKey 在插件内全程是明文，一旦原样打进
+// 日志，用户凭证就落到了网关的 stdout / 日志采集里 —— Warn 级别的那几条在默认日志
+// 级别下就会输出，不需要谁去调低级别。后 8 位与 x-mse-consumer 里的后缀、以及
+// ai-credit-check 的告警格式一致，运维仍能把三处日志对上。
+func maskApiKey(key string) string {
+	if len(key) <= 8 {
+		return "***"
+	}
+	return "***" + key[len(key)-8:]
+}
+
+// maskRedisKeyTail 脱敏 Redis key —— 它的后缀就是 apiKey（非 hash 模式下是明文），
+// 前缀（含 ruleName）保留，排障时仍看得出 key 的结构与归属规则。
+func maskRedisKeyTail(redisKey string) string {
+	if i := strings.LastIndex(redisKey, ":"); i >= 0 {
+		return redisKey[:i+1] + maskApiKey(redisKey[i+1:])
+	}
+	return maskApiKey(redisKey)
+}
+
 // ============================================================================
 // Redis Key 生成
 // ============================================================================
@@ -551,7 +573,7 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config QuotaConfig) types.Act
 	ctx.SetContext(ctxKeyApiKey, apiKey)
 	ctx.SetContext(ctxKeyRuleName, config.RuleName)
 
-	log.Debugf("chatMode:%s, adminMode:%s, apiKey:%s", chatMode, adminMode, apiKey)
+	log.Debugf("chatMode:%s, adminMode:%s, apiKey:%s", chatMode, adminMode, maskApiKey(apiKey))
 
 	// 管理模式处理
 	if chatMode == ChatModeAdmin {
@@ -590,7 +612,7 @@ func checkQuotaAndFetchPreset(ctx wrapper.HttpContext, config QuotaConfig, apiKe
 	config.redisClient.Get(redisKey, func(response resp.Value) {
 		// Key 不存在，跳过配额检查
 		if response.IsNull() {
-			log.Debugf("apiKey:%s has no quota configured, skipping quota check", apiKey)
+			log.Debugf("apiKey:%s has no quota configured, skipping quota check", maskApiKey(apiKey))
 			ctx.SetContext(ctxKeyHasQuotaConfig, false)
 			proxywasm.ResumeHttpRequest()
 			return
@@ -598,7 +620,7 @@ func checkQuotaAndFetchPreset(ctx wrapper.HttpContext, config QuotaConfig, apiKe
 
 		// Redis 错误，允许请求继续
 		if err := response.Error(); err != nil {
-			log.Warnf("redis error for apiKey:%s: %v, allowing request", apiKey, err)
+			log.Warnf("redis error for apiKey:%s: %v, allowing request", maskApiKey(apiKey), err)
 			ctx.SetContext(ctxKeyHasQuotaConfig, false)
 			proxywasm.ResumeHttpRequest()
 			return
@@ -607,12 +629,12 @@ func checkQuotaAndFetchPreset(ctx wrapper.HttpContext, config QuotaConfig, apiKe
 		// 检查配额是否足够
 		remainingQuota := response.Integer()
 		if remainingQuota <= 0 {
-			log.Debugf("apiKey:%s quota:%d isDenied:true", apiKey, remainingQuota)
+			log.Debugf("apiKey:%s quota:%d isDenied:true", maskApiKey(apiKey), remainingQuota)
 			util.SendResponse(http.StatusForbidden, "ai-quota-apikey.noquota", "text/plain", "Request denied by ai quota check, No quota left")
 			return
 		}
 
-		log.Debugf("apiKey:%s quota:%d isDenied:false", apiKey, remainingQuota)
+		log.Debugf("apiKey:%s quota:%d isDenied:false", maskApiKey(apiKey), remainingQuota)
 		ctx.SetContext(ctxKeyHasQuotaConfig, true)
 		// 保存当前剩余配额到上下文（用于响应阶段计算新值）
 		ctx.SetContext(ctxKeyRemainingQuota, int(remainingQuota))
@@ -620,7 +642,7 @@ func checkQuotaAndFetchPreset(ctx wrapper.HttpContext, config QuotaConfig, apiKe
 		// 第二步：获取 Hash 中的预设配额（用于响应阶段更新）
 		config.redisClient.HGet(totalQuotaKey, apiKeyForHash, func(hashResponse resp.Value) {
 			if err := hashResponse.Error(); err != nil {
-				log.Warnf("Failed to get preset quota for apiKey:%s, error:%v", apiKey, err)
+				log.Warnf("Failed to get preset quota for apiKey:%s, error:%v", maskApiKey(apiKey), err)
 				proxywasm.ResumeHttpRequest()
 				return
 			}
@@ -637,7 +659,7 @@ func checkQuotaAndFetchPreset(ctx wrapper.HttpContext, config QuotaConfig, apiKe
 					if username != "" {
 						ctx.SetContext(ctxKeyQuotaUsername, username)
 					}
-					log.Debugf("apiKey:%s presetQuota:%d remainingQuota:%d name:%s username:%s saved to context", apiKey, presetQuota, remainingQuota, name, username)
+					log.Debugf("apiKey:%s presetQuota:%d remainingQuota:%d name:%s username:%s saved to context", maskApiKey(apiKey), presetQuota, remainingQuota, name, username)
 				}
 			}
 			proxywasm.ResumeHttpRequest()
@@ -733,7 +755,7 @@ func updateQuotaOnConsumption(ctx wrapper.HttpContext, config QuotaConfig, apiKe
 	totalQuotaKey := getTotalQuotaKey(config, ruleName)
 	apiKeyForHash := getApiKeyForHash(config, apiKey)
 
-	log.Debugf("updateQuota: apiKey=%s, ruleName=%s, totalToken=%d", apiKey, ruleName, totalToken)
+	log.Debugf("updateQuota: apiKey=%s, ruleName=%s, totalToken=%d", maskApiKey(apiKey), ruleName, totalToken)
 
 	// 1. 更新单个配额 Key（fire-and-forget，与 ai-quota 插件一致）
 	config.redisClient.DecrBy(redisKey, totalToken, nil)
@@ -775,7 +797,7 @@ func updateQuotaOnConsumption(ctx wrapper.HttpContext, config QuotaConfig, apiKe
 	// 更新 Hash（fire-and-forget），保持 name 和 username 字段
 	newQuotaValue := formatQuotaValue(presetQuota, newRemainingQuota, name, username)
 	log.Debugf("Updating hash: key=%s, field=%s, value=%s (preset=%d, remaining=%d->%d, consumed=%d, name=%s, username=%s)",
-		totalQuotaKey, apiKeyForHash, newQuotaValue, presetQuota, currentRemainingQuota, newRemainingQuota, totalToken, name, username)
+		totalQuotaKey, maskApiKey(apiKeyForHash), newQuotaValue, presetQuota, currentRemainingQuota, newRemainingQuota, totalToken, name, username)
 	config.redisClient.HSet(totalQuotaKey, apiKeyForHash, newQuotaValue, nil)
 }
 
@@ -827,18 +849,18 @@ func refreshQuota(ctx wrapper.HttpContext, config QuotaConfig, adminApiKey strin
 			return
 		}
 
-		log.Debugf("Redis set key=%s quota=%d", redisKey, quota)
+		log.Debugf("Redis set key=%s quota=%d", maskRedisKeyTail(redisKey), quota)
 
 		// 更新 Hash
 		err := config.redisClient.HSet(totalQuotaKey, apiKeyForHash, quotaValue, func(hashResponse resp.Value) {
 			if err := hashResponse.Error(); err != nil {
-				log.Warnf("Failed to update hash quota for apiKey:%s, error:%v", queryApiKey, err)
+				log.Warnf("Failed to update hash quota for apiKey:%s, error:%v", maskApiKey(queryApiKey), err)
 			} else {
-				log.Debugf("Updated hash quota for apiKey:%s, value:%s", queryApiKey, quotaValue)
+				log.Debugf("Updated hash quota for apiKey:%s, value:%s", maskApiKey(queryApiKey), quotaValue)
 			}
 		})
 		if err != nil {
-			log.Warnf("Failed to call HSet for apiKey:%s, error:%v", queryApiKey, err)
+			log.Warnf("Failed to call HSet for apiKey:%s, error:%v", maskApiKey(queryApiKey), err)
 		}
 
 		util.SendResponse(http.StatusOK, "ai-quota-apikey.refreshquota", "application/json", `{"message":"refresh quota successful"}`)
@@ -933,12 +955,12 @@ func deleteQuota(ctx wrapper.HttpContext, config QuotaConfig, adminApiKey string
 
 		// Redis Del 命令即使 key 不存在也会返回成功（返回删除的数量，可能是 0）
 		deletedCount := response.Integer()
-		log.Debugf("Redis deleted key=%s, deleted count=%d", redisKey, deletedCount)
+		log.Debugf("Redis deleted key=%s, deleted count=%d", maskRedisKeyTail(redisKey), deletedCount)
 
 		// 删除 Hash 中的 field（即使 field 不存在也返回成功）
 		hdelErr := config.redisClient.HDel(totalQuotaKey, []string{apiKeyForHash}, func(hashResponse resp.Value) {
 			if hashErr := hashResponse.Error(); hashErr != nil {
-				log.Warnf("Failed to delete hash field for apiKey:%s, error:%v", queryApiKey, hashErr)
+				log.Warnf("Failed to delete hash field for apiKey:%s, error:%v", maskApiKey(queryApiKey), hashErr)
 				// 即使 Hash 删除失败，也返回成功
 				util.SendResponse(http.StatusOK, "ai-quota-apikey.deletequota", "application/json", `{"message":"delete quota successful"}`)
 				return
@@ -946,11 +968,11 @@ func deleteQuota(ctx wrapper.HttpContext, config QuotaConfig, adminApiKey string
 
 			// HDel 返回删除的 field 数量，即使 field 不存在也会返回 0，但不报错
 			deletedFields := hashResponse.Integer()
-			log.Debugf("Deleted hash field for apiKey:%s, field:%s, deleted fields=%d", queryApiKey, apiKeyForHash, deletedFields)
+			log.Debugf("Deleted hash field for apiKey:%s, field:%s, deleted fields=%d", maskApiKey(queryApiKey), maskApiKey(apiKeyForHash), deletedFields)
 			util.SendResponse(http.StatusOK, "ai-quota-apikey.deletequota", "application/json", `{"message":"delete quota successful"}`)
 		})
 		if hdelErr != nil {
-			log.Warnf("Failed to call HDel for apiKey:%s, error:%v", queryApiKey, hdelErr)
+			log.Warnf("Failed to call HDel for apiKey:%s, error:%v", maskApiKey(queryApiKey), hdelErr)
 			// 即使 HDel 调用失败，也返回成功
 			util.SendResponse(http.StatusOK, "ai-quota-apikey.deletequota", "application/json", `{"message":"delete quota successful"}`)
 			return
@@ -984,7 +1006,7 @@ func buildQuotaList(response resp.Value, ruleName string) []map[string]interface
 
 		presetQuota, remainingQuota, name, username, err := parseQuotaValue(quotaValueStr)
 		if err != nil {
-			log.Warnf("Failed to parse quota value for apiKey:%s, value:%s, error:%v", apiKeyField, quotaValueStr, err)
+			log.Warnf("Failed to parse quota value for apiKey:%s, value:%s, error:%v", maskApiKey(apiKeyField), quotaValueStr, err)
 			continue
 		}
 

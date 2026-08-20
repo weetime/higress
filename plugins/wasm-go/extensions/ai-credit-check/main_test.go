@@ -197,3 +197,180 @@ func TestArrayBlockedUsersDoesNotSilentlyBlockWrongKey(t *testing.T) {
 			"blocked_users 是数组时应按空名单处理，不能误把数组下标当用户名拉黑")
 	})
 }
+
+// ============================================================================
+// blocked_api_keys
+// ============================================================================
+
+const (
+	cfgKeyOnly       = `{"blocked_api_keys":{"sk-user-aaaaaaaa":{}}}`
+	cfgKeyAndUser    = `{"blocked_users":{"alice":{}},"blocked_api_keys":{"sk-user-aaaaaaaa":{}}}`
+	cfgKeyCustomHdr  = `{"blocked_api_keys":{"sk-user-aaaaaaaa":{}},"auth_header_name":"x-custom-key"}`
+	cfgKeyEmptyLists = `{"blocked_users":{},"blocked_api_keys":{}}`
+)
+
+// blocked_api_keys 与 blocked_users 一样由外部计费系统写入，形状同样不可控，
+// 任何一种畸形都不能让插件配置加载失败。
+func TestParseConfigNeverFailsWithApiKeys(t *testing.T) {
+	cases := []string{
+		`{"blocked_api_keys":{}}`,
+		`{"blocked_api_keys":{"sk-a":{}}}`,
+		`{"blocked_api_keys":{"sk-a":null}}`,
+		`{"blocked_api_keys":{"sk-a":{"reason":"debt"}}}`,
+		`{"blocked_api_keys":{"  ":{}}}`,
+		`{"blocked_api_keys":["sk-a"]}`,
+		`{"blocked_api_keys":"sk-a"}`,
+		`{"blocked_api_keys":{"Bearer sk-a":{}}}`,
+		`{"blocked_api_keys":{"sk-a":{}},"auth_header_name":123}`,
+	}
+	test.RunGoTest(t, func(t *testing.T) {
+		for _, c := range cases {
+			t.Run(c, func(t *testing.T) {
+				host, status := test.NewTestHost(json.RawMessage(c))
+				defer host.Reset()
+				require.Equal(t, types.OnPluginStartStatusOK, status)
+			})
+		}
+	})
+}
+
+// 两个名单都为空 = 全放行（快速路径，连 header 都不读）。
+func TestBothListsEmptyAllowsEveryone(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		requireAllowed(t, cfgKeyEmptyLists,
+			headersWith([2]string{"Authorization", "Bearer sk-user-aaaaaaaa"}),
+			"两个名单都为空时不应拦截")
+	})
+}
+
+// 核心用例：OpenAI 风格 Authorization: Bearer <key> 命中名单 -> 402。
+// 这里同时锁住「本插件跑在 ai-proxy 之前，拿得到客户端原始 Authorization」这个前提。
+func TestBlockedApiKeyInBearerHeaderIsDenied(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		requireDenied(t, cfgKeyOnly,
+			headersWith([2]string{"Authorization", "Bearer sk-user-aaaaaaaa"}),
+			"名单中的 apiKey 应被 402 拦截")
+	})
+}
+
+// Authorization 不带 Bearer 前缀时按原值处理（与 ai-route-auth 一致）。
+func TestBlockedApiKeyWithoutBearerPrefixIsDenied(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		requireDenied(t, cfgKeyOnly,
+			headersWith([2]string{"Authorization", "sk-user-aaaaaaaa"}),
+			"无 Bearer 前缀的 Authorization 应按原值匹配")
+	})
+}
+
+// Anthropic 风格：x-api-key 直接给裸 token。
+func TestBlockedApiKeyInAnthropicHeaderIsDenied(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		requireDenied(t, cfgKeyOnly,
+			headersWith([2]string{"x-api-key", "sk-user-aaaaaaaa"}),
+			"x-api-key 中的 apiKey 应被拦截")
+	})
+}
+
+// header 值前后的空白必须被裁掉，否则会漏拦。
+func TestApiKeyIsTrimmed(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		requireDenied(t, cfgKeyOnly,
+			headersWith([2]string{"Authorization", "  Bearer   sk-user-aaaaaaaa  "}),
+			"前后空白不应导致漏拦")
+	})
+}
+
+// 不在名单里的 key 放行。
+func TestUnblockedApiKeyIsAllowed(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		requireAllowed(t, cfgKeyOnly,
+			headersWith([2]string{"Authorization", "Bearer sk-user-bbbbbbbb"}),
+			"不在名单里的 apiKey 应放行")
+	})
+}
+
+// 完全没有凭证头 = 无 key 可判，放行（访问控制不是本插件的职责）。
+func TestNoAuthHeaderIsAllowed(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		requireAllowed(t, cfgKeyOnly, headersWith(),
+			"没有任何凭证头时应放行")
+	})
+}
+
+// 两个维度是 OR：user 没进名单，但它用的 key 进了名单，照样拦。
+func TestUserAllowedButApiKeyBlocked(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		requireDenied(t, cfgKeyAndUser,
+			headersWith(
+				[2]string{"x-mse-consumer", "bob/aaaaaaaa"},
+				[2]string{"Authorization", "Bearer sk-user-aaaaaaaa"}),
+			"user 放行但 key 在名单里时应拦截")
+	})
+}
+
+// 反向：key 没进名单，但 user 进了名单，仍按 user 维度拦。
+func TestApiKeyAllowedButUserBlocked(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		requireDenied(t, cfgKeyAndUser,
+			headersWith(
+				[2]string{"x-mse-consumer", "alice/bbbbbbbb"},
+				[2]string{"Authorization", "Bearer sk-user-bbbbbbbb"}),
+			"key 放行但 user 在名单里时应拦截")
+	})
+}
+
+// 模型降级（internal_redirect）重入：Authorization 已被上一趟 ai-proxy 换成上游
+// provider 的 apiToken，用户真实凭证在 X-HI-ORIGINAL-AUTH 里。若这里读错 header，
+// 欠费的 key 会在降级链路上被静默放行。
+func TestBlockedApiKeyOnFallbackReadsOriginalAuth(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		requireDenied(t, cfgKeyOnly,
+			headersWith(
+				[2]string{"x-higress-fallback-from", "primary-model"},
+				[2]string{"X-HI-ORIGINAL-AUTH", "Bearer sk-user-aaaaaaaa"},
+				[2]string{"Authorization", "Bearer sk-infer-upstream-token"}),
+			"降级重入时应按 X-HI-ORIGINAL-AUTH 中的原始凭证判定")
+	})
+}
+
+// 首跳（没有 x-higress-fallback-from）不信任客户端自带的 X-HI-ORIGINAL-AUTH，
+// 一律以正常凭证头为准 —— 否则客户端伪造一个该头就能换一把没欠费的身份。
+func TestOriginalAuthIsIgnoredWithoutFallbackMarker(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		requireAllowed(t, cfgKeyOnly,
+			headersWith(
+				[2]string{"X-HI-ORIGINAL-AUTH", "Bearer sk-user-aaaaaaaa"},
+				[2]string{"Authorization", "Bearer sk-user-bbbbbbbb"}),
+			"首跳不应信任客户端自带的 X-HI-ORIGINAL-AUTH")
+	})
+}
+
+// auth_header_name 配成非默认值时，优先从该 header 取原值（不做 Bearer 解析），
+// 语义与 ai-route-auth 对齐。
+func TestCustomAuthHeaderName(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		requireDenied(t, cfgKeyCustomHdr,
+			headersWith([2]string{"x-custom-key", "sk-user-aaaaaaaa"}),
+			"自定义 auth_header_name 应被优先读取")
+	})
+}
+
+// blocked_api_keys 被误写成 JSON 数组时，同样必须等价于空名单，
+// 不能把数组下标（"0"）当成 key 拉黑。
+func TestArrayBlockedApiKeysIsTreatedAsEmpty(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		requireAllowed(t, `{"blocked_api_keys":["sk-user-aaaaaaaa"]}`,
+			headersWith([2]string{"Authorization", "Bearer sk-user-aaaaaaaa"}),
+			"blocked_api_keys 是数组时应按空名单处理")
+	})
+}
+
+// 名单项误带 "Bearer " 前缀时不会命中（插件比对的是剥离前缀后的裸 token）。
+// 这里把该行为固化下来：parseConfig 会为此打 Warn，但不会「猜」用户的意图。
+func TestBearerPrefixedListEntryDoesNotMatch(t *testing.T) {
+	test.RunGoTest(t, func(t *testing.T) {
+		requireAllowed(t, `{"blocked_api_keys":{"Bearer sk-user-aaaaaaaa":{}}}`,
+			headersWith([2]string{"Authorization", "Bearer sk-user-aaaaaaaa"}),
+			"名单项带 Bearer 前缀时不应命中（配置错误，已有 Warn）")
+	})
+}

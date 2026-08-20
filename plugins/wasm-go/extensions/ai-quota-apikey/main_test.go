@@ -106,3 +106,43 @@ func TestNoCredentialIsError(t *testing.T) {
 	_, err := resolveApiKeyFromHeaders(fakeHeaders(map[string]string{}), defaultAuthHeaderName)
 	require.Error(t, err)
 }
+
+// ============================================================================
+// 凭证脱敏
+// ============================================================================
+
+// 日志里绝不能出现完整 apiKey：hash_api_key 默认关闭，插件内全程持有明文，
+// 而 Warn 级别的几条日志在默认日志级别下就会输出。
+func TestMaskApiKey(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"常规 key 只留后 8 位", "sk-user-abcdefgh", "***abcdefgh"},
+		{"恰好 8 位全部隐藏", "abcdefgh", "***"},
+		{"短 key 全部隐藏", "sk-1", "***"},
+		{"空值", "", "***"},
+		{"9 位露出后 8 位", "xabcdefgh", "***abcdefgh"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := maskApiKey(c.in)
+			require.Equal(t, c.want, got)
+			// 兜底断言：脱敏结果不得包含完整原值（长度 > 8 时）
+			if len(c.in) > 8 {
+				require.NotContains(t, got, c.in)
+			}
+		})
+	}
+}
+
+// Redis key 的后缀就是 apiKey（非 hash 模式下是明文），前缀要保留以便排障。
+func TestMaskRedisKeyTail(t *testing.T) {
+	require.Equal(t, "chat_quota_apikey:***abcdefgh",
+		maskRedisKeyTail("chat_quota_apikey:sk-user-abcdefgh"))
+	require.Equal(t, "chat_quota_apikey_infer-xxx:***abcdefgh",
+		maskRedisKeyTail("chat_quota_apikey_infer-xxx:sk-user-abcdefgh"))
+	// 没有分隔符时整体脱敏，不能原样吐出来
+	require.Equal(t, "***abcdefgh", maskRedisKeyTail("sk-user-abcdefgh"))
+}
