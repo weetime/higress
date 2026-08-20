@@ -1,0 +1,123 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: ext-header-enrich.rise.io
+  namespace: higress-system
+  annotations:
+    higress.io/wasm-plugin-description: 请求转发给上游前，按调用方身份注入用户属性请求头（x-hgw-*），属性来自 AUC 并按 username 缓存在 Redis。
+    higress.io/wasm-plugin-title: ext-header-enrich
+  labels:
+    higress.io/resource-definer: higress
+    higress.io/wasm-plugin-built-in: "false"
+    higress.io/wasm-plugin-category: custom
+    higress.io/wasm-plugin-name: ext-header-enrich
+    higress.io/wasm-plugin-version: 0.0.1
+spec:
+  # ==========================================================================
+  # 【强制前置依赖，务必先读】
+  #
+  # 本插件必须与 ai-route-auth 或 mcp-server-auth 挂在同一条路由上，且排在其后执行。
+  #
+  # 插件不自己解析 api-key，而是复用认证插件写入的 x-mse-consumer（<username>/<key后8位>）。
+  # 那是一个普通请求头，客户端完全可以自带 x-mse-consumer: admin/xxxxxxxx。
+  # 挂了认证插件时这不构成风险：ai-route-auth 认证失败直接拒绝请求，mcp-server-auth 的
+  # clearConsumerHeaders() 会在身份没解析出来时清掉客户端自带的该头。
+  #
+  # 但【单独挂载本插件等于把用户邮箱、手机号做成匿名可读】。
+  # ==========================================================================
+  defaultConfig:
+    # ------------------------------------------------------------------ 必填
+    auc:
+      # 网关侧需能解析到 AUC。集群侧要有对应的服务发现条目，否则所有回源都会失败，
+      # 并在 on_error: allow 下静默放行 —— 表现为「插件没生效」而不是报错。
+      service_name: auc.dns
+      # ⚠️ 填 Service 端口，不是容器端口。AUC 容器监听 8002（config.rise.yaml 的
+      # server.http.addr），但 Service auc 暴露的是 80 → targetPort http。McpBridge 的
+      # dns 条目按 Service 端口注册，生成的 envoy cluster 是 outbound|80||auc.dns；
+      # 这里写 8002 会去找不存在的 outbound|8002||auc.dns，回源全部失败且静默走 on_error。
+      service_port: 80
+      # 与 AUC 的共享密钥，以 x-gateway-token 头发出。
+      # AUC 侧取自环境变量 GATEWAY_ATTR_TOKEN，服务端未配置密钥时一律拒绝（fail-close）。
+      gateway_token: "<共享密钥>"
+      # 以下两项可选
+      path: /v1/user/gateway-attributes
+      timeout: 2000 # 毫秒
+
+    redis:
+      service_name: redis-master.dns
+      service_port: 6379
+      timeout: 2000
+      # username / password / database 可选，与 ai-quota-apikey 同构
+
+    # ------------------------------------------------------------------ 可选
+    # 属性缓存 TTL（秒）。TTL 内 AUC 侧的改动不会反映到网关。
+    cache_ttl: 300
+    # AUC 回 404（用户不存在/已禁用）时的负缓存 TTL（秒）。
+    # 一把仍在流通、但对应用户已销号的 api-key，不缓存的话每个请求都会同步回源一次 AUC。
+    # 注意：要关闭负缓存请在这里显式写 0，写在 matchRule 里的 0 会被当成「没配」而填回默认值。
+    negative_cache_ttl: 30
+    # 缓存 key 形如 <cache_key_prefix>:<username>
+    cache_key_prefix: ext_header_enrich
+    # allow（默认）= 放行但不注入任何 x-hgw-* 头；deny = 返回 503。
+    # 默认 allow：本插件职责是信息富化不是认证，认证由 ai-route-auth / mcp-server-auth
+    # 把关，AUC 抖动不应把业务流量打挂。
+    on_error: allow
+
+  matchRules:
+    # matchRule 的 config 是【字段级覆盖】而不是整体替换：上面 defaultConfig 那份是基底，
+    # 这里只写要改的字段即可，不必重复抄一遍密钥与连接信息。
+    #
+    # 示例1：完全继承 defaultConfig
+    - config: {}
+      ingress:
+        - ai-route-infer-8d9e797b-a180-4858-997e-c74857eb46df.internal
+
+    # 示例2：这条路由要求属性必须拿到，拿不到就拒绝
+    # - config:
+    #     on_error: deny
+    #   ingress:
+    #     - ai-route-infer-xxx.internal
+
+  # 【不能设成 true】。higress 的 convertIstioWasmPlugin 在 defaultConfigDisable 为 true 时
+  # 会把整个 defaultConfig 丢掉，只把 _rules_ 下发给插件（pkg/ingress/config/ingress_config.go），
+  # 上面「defaultConfig 作基底 + matchRule 字段级覆盖」的模型就不成立了 —— 每条 matchRule
+  # 都得自带 auc/redis 全套配置才能工作。集群里实际部署的 ai-route-auth CR 同样是 false
+  # （higress-helm/charts/higress-rise/templates/ai-route-auth.rise.io.yaml）。
+  #
+  # 代价是：没命中任何 matchRule 的路由也会执行本插件。这是可接受的 —— 插件在这种情况下
+  # 只做 x-hgw-* 命名空间清理（防伪造），不做富化、不打 Redis、也不回源 AUC。
+  defaultConfigDisable: false
+  # FAIL_OPEN 而不是 FAIL_CLOSE —— 这一项管的是「wasm VM 本身起不来/panic」时的行为，
+  # 与配置项 on_error（取不到属性时的行为）是两回事。
+  #
+  # 为什么不能用 FAIL_CLOSE：本插件的 filter 挂在 listener 的 HTTP filter chain 上
+  # （config_dump 里与其余十几个插件并列），per-route 的区分是插件自己读 _rules_ 做的。
+  # 而 failStrategy 生效在插件代码跑起来之前 —— VM 加载失败时 FAIL_CLOSE 会让走该
+  # listener 的【全部流量】被拒，不只是配了 matchRule 的那几条路由。为一个信息富化功能
+  # 承担全网关 503 的风险不划算，况且新插件恰恰是最可能加载失败的那个（本仓库已有
+  # waf-1.0.0 的 WASI 导入不被支持、ljl-test-1 的 url 填成应用镜像两个先例）。
+  #
+  # 这也与本插件自己的 on_error: allow 默认值一致 —— 既然「AUC 抖动不该把业务流量打挂」，
+  # VM 故障更不该，而且后者是全网关范围。
+  #
+  # 代价：VM 挂掉时清理 x-hgw-* 的那一步也不执行，客户端伪造的头会透传到上游。
+  # 彻底的补位是把 x-hgw- 前缀清理下沉到 ai-route-auth / mcp-server-auth（它们是
+  # FAIL_CLOSE，且本就在清 x-mse-consumer），形成双保险。
+  #
+  # 对照：网关上 13 个插件是 FAIL_OPEN，只有 ai-route-auth / mcp-server-auth 是
+  # FAIL_CLOSE —— 那两个是认证插件，失败时拒绝才是正确语义；本插件不属于那一类。
+  failStrategy: FAIL_OPEN
+  imagePullPolicy: UNSPECIFIED_POLICY
+  # AUTHZ/600 是同时满足两个约束的唯一位置：
+  #   mcp-server-auth  AUTHN/320       -> 早于本插件（AUTHN 阶段整体早于 AUTHZ）
+  #   ai-route-auth    AUTHZ/700       -> 早于本插件（同 AUTHZ，priority 大的先执行）
+  #   ext-header-enrich AUTHZ/600      -> 本插件
+  #   ai-proxy         UNSPECIFIED/100 -> 晚于本插件
+  # 这是功能正确性的前提：本插件必须后执行才读得到 x-mse-consumer。
+  # 600 也远高于 ai-proxy(100)，避开「AI 路由上优先级低于 ai-proxy 的插件永不执行」这一约束。
+  phase: AUTHZ
+  priority: 600
+  # For local testing, use file:// URL
+  # url: file:///opt/plugins/wasm-go/extensions/ext-header-enrich/plugin.wasm
+  # For production, use OCI registry
+  url: oci://quanzhenglong.com/camp/higress/ext-header-enrich:v0.0.1
