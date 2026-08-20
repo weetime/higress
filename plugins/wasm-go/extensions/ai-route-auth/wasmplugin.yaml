@@ -121,6 +121,40 @@ spec:
     #     - ai-route-infer-yyy.internal
 
   defaultConfigDisable: true
+  # FAIL_CLOSE：本插件是链路上【唯一】校验 API Key 真伪的一层
+  # （main.go Step 2 取不到凭证 -> 401，Step 3 key 不在 user_apikeys -> 403）。
+  # 它失效意味着匿名 / 伪造 key 的请求可直达推理服务，是越权而非有界损失，因此
+  # 宁可让流量失败也不能放行。istio 的 failStrategy 枚举注释也明确写了 FAIL_OPEN
+  # "is not recommended for the authentication or the authorization plugins"。
+  # 兄弟插件里只有本插件是 FAIL_CLOSE，其余（ai-quota-apikey / mcp-server-auth /
+  # model-analytics / qwen3guard）均为 FAIL_OPEN —— 分界线是"失效是否等于越权"。
+  # 别指望其它插件补位：ai-quota-apikey 只挡"完全不带 key"，不校验 key 合法性；
+  # 且插件失效是【相关的】，plugin-server / registry 不可用会同时打掉所有插件。
+  #
+  # ⚠️ 代价：wasm filter 挂在网关 listener 上、非按路由生效，所以 wasm 拉取或启动
+  #    失败时是【全站】所有流量 5xx，不只是本插件命中的 AI 路由。本环境发生过 OCI URL
+  #    被改坏导致网关 Pod 卡在 0/1 INITIALIZING 的真实故障。
+  #    为把这个风险压到可接受，以下两个不变量【必须】维持，改代码时不得破坏：
+  #      1. parseConfig / parseRuleConfig 永不返回 error（见 main.go 里的说明）。
+  #         ParseOverrideConfigBy 下任一 matchRule 解析失败会让整个插件配置加载失败，
+  #         配合 FAIL_CLOSE 就是配置写歪即全站 5xx。校验失败要转成运行期的
+  #         deny-all 语义，而不是启动期 error。
+  #      2. defaultConfigDisable: true，保证空 defaultConfig 不会被喂给 parseConfig；
+  #         且无有效 matchRule 时 controller 直接不下发插件、不建 wasm VM。
+  #    发布纪律：改 url / 版本前先确认该版本在 plugin-server（或 registry）上真实可拉取，
+  #    先发包、确认可拉、再改 CR。FAIL_CLOSE 的故障面几乎全部集中在这一步。
+  #
+  # ⚠️ 本字段会被 console 静默改掉：higress-console 的
+  #    KubernetesModelConverter.setDefaultValues() 无条件把 failStrategy 覆盖成
+  #    FAIL_OPEN（三处调用点覆盖了从 console 改插件配置的所有路径）。只要有人在
+  #    console 上动过本插件，这里的 FAIL_CLOSE 在集群里就已经不是 FAIL_CLOSE 了。
+  #    所以 FAIL_CLOSE 只是兜底，不是防线，需要定期核对线上实际值：
+  #      kubectl get wasmplugin -n higress-system \
+  #        -o custom-columns=NAME:.metadata.name,FAIL:.spec.failStrategy
+  #    并且仍需拨测来发现"插件已被 bypass"：对受保护路由发
+  #      (a) 不带 Authorization        -> 期望 401
+  #      (b) 带一个不存在的 api key    -> 期望 403
+  #    任一返回 200 即说明鉴权已失效，立即告警。
   failStrategy: FAIL_CLOSE
   imagePullPolicy: UNSPECIFIED_POLICY
   phase: AUTHZ

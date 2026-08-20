@@ -120,7 +120,18 @@ spec:
   #   ingress:
   #   - ai-route-example.internal
   defaultConfigDisable: false
-  failStrategy: FAIL_CLOSE
+  # FAIL_OPEN：与插件自身的运行时姿态保持一致 —— main.go 里 Redis 报错时就是直接放行的
+  # （"redis error ... allowing request" + ResumeHttpRequest），查不到配额配置也放行。
+  # 既然后端存储挂了都接受"配额被绕过"，就没有理由在 wasm 加载失败时把整个网关打成 5xx。
+  #
+  # 另外本插件是几个自研插件里风险面最大的一个：唯一 defaultConfigDisable: false，且
+  # parseConfig 有 4 处硬失败（admin_api_key / api_key_source / redis / redis.service_name）。
+  # 配置被改歪 -> plugin start failed -> FAIL_CLOSE 下就是全站 5xx。
+  # （ext-auth、cluster-key-rate-limit 都已各踩过一次 wasm VM 配置失败的坑。）
+  #
+  # 代价：加载失败时配额不计不扣，且事后无法从插件侧追补，但损失有界。
+  # 必须为网关 Pod 的 wasm 加载失败 / plugin start failed 日志配告警，否则失效是静默的。
+  failStrategy: FAIL_OPEN
   imagePullPolicy: UNSPECIFIED_POLICY
   phase: UNSPECIFIED_PHASE
   priority: 280
