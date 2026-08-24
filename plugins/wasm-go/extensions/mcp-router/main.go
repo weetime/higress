@@ -16,6 +16,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -63,6 +64,15 @@ func ParseGlobalConfig(configBytes []byte, globalConfig *any) error {
 		return fmt.Errorf("failed to parse mcp-router config: %v", err)
 	}
 
+	for i, server := range config.Servers {
+		if server.Name == "" {
+			return fmt.Errorf("servers[%d].name is required", i)
+		}
+		if server.Path == "" {
+			return fmt.Errorf("servers[%d].path is required (server %q)", i, server.Name)
+		}
+	}
+
 	log.Infof("Parsed mcp-router config with %d servers", len(config.Servers))
 	for _, server := range config.Servers {
 		log.Debugf("Server: %s -> %s%s", server.Name, server.Domain, server.Path)
@@ -74,11 +84,21 @@ func ParseGlobalConfig(configBytes []byte, globalConfig *any) error {
 
 func ParseOverrideConfig(configBytes []byte, globalConfig any, ruleConfig *any) error {
 	var config McpRouterConfig
+	enable := gjson.GetBytes(configBytes, "enable").Bool()
 	if globalConfig == nil {
+		// The `servers` routing table only ever lives in the global config, so without it
+		// this filter cannot route anything. The usual cause is `defaultConfigDisable: true`
+		// on the WasmPlugin: Higress then omits `defaultConfig` from the wasm configuration,
+		// leaving `_rules_` as the only top-level key, and the rule matcher skips global
+		// config parsing entirely. Fail loudly instead of silently accepting a rule that
+		// asked to be enabled.
+		if enable {
+			return errors.New("mcp-router is enabled on this rule but no global config was parsed; " +
+				"declare the `servers` routing table under `defaultConfig` and do not set `defaultConfigDisable: true`")
+		}
 		config.global = &McpRouterGlobalConfig{}
 		config.enable = false
 		*ruleConfig = config
-		log.Error("globalConfig not found, mcp router will not work")
 		return nil
 	}
 	parent, ok := globalConfig.(McpRouterGlobalConfig)
@@ -86,7 +106,7 @@ func ParseOverrideConfig(configBytes []byte, globalConfig any, ruleConfig *any) 
 		return fmt.Errorf("invalid globalConfig: %v", globalConfig)
 	}
 	config.global = &parent
-	config.enable = gjson.GetBytes(configBytes, "enable").Bool()
+	config.enable = enable
 	*ruleConfig = config
 	return nil
 }
